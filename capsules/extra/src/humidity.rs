@@ -25,16 +25,15 @@
 //! The `command` system call support one argument `cmd` which is used to specify the specific
 //! operation, currently the following cmd's are supported:
 //!
-//! * `0`: check whether the driver exist
+//! * `0`: check whether the driver exists
 //! * `1`: read humidity
 //!
 //!
 //! The possible return from the 'command' system call indicates the following:
 //!
 //! * `Ok(())`:    The operation has been successful.
-//! * `BUSY`:      The driver is busy.
-//! * `ENOSUPPORT`: Invalid `cmd`.
-//! * `NOMEM`:     No sufficient memory available.
+//! * `NOSUPPORT`: Invalid `cmd`.
+//! * `NOMEM`:     Insufficient memory available.
 //! * `INVAL`:     Invalid address of the buffer or other error.
 //!
 //! Usage
@@ -42,7 +41,7 @@
 //!
 //! You need a device that provides the `hil::sensors::HumidityDriver` trait.
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let humidity = static_init!(
@@ -74,19 +73,19 @@ pub struct App {
     subscribed: bool,
 }
 
-pub struct HumiditySensor<'a> {
-    driver: &'a dyn hil::sensors::HumidityDriver<'a>,
+pub struct HumiditySensor<'a, H: hil::sensors::HumidityDriver<'a>> {
+    driver: &'a H,
     apps: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
     busy: Cell<bool>,
 }
 
-impl<'a> HumiditySensor<'a> {
+impl<'a, H: hil::sensors::HumidityDriver<'a>> HumiditySensor<'a, H> {
     pub fn new(
-        driver: &'a dyn hil::sensors::HumidityDriver<'a>,
+        driver: &'a H,
         grant: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
-    ) -> HumiditySensor<'a> {
+    ) -> HumiditySensor<'a, H> {
         HumiditySensor {
-            driver: driver,
+            driver,
             apps: grant,
             busy: Cell::new(false),
         }
@@ -100,12 +99,13 @@ impl<'a> HumiditySensor<'a> {
     ) -> CommandReturn {
         self.apps
             .enter(processid, |app, _| {
+                app.subscribed = true;
+
                 if !self.busy.get() {
-                    app.subscribed = true;
                     self.busy.set(true);
                     self.call_driver(command, arg1)
                 } else {
-                    CommandReturn::failure(ErrorCode::BUSY)
+                    CommandReturn::success()
                 }
             })
             .unwrap_or_else(|err| CommandReturn::failure(err.into()))
@@ -119,21 +119,24 @@ impl<'a> HumiditySensor<'a> {
     }
 }
 
-impl hil::sensors::HumidityClient for HumiditySensor<'_> {
-    fn callback(&self, tmp_val: usize) {
+impl<'a, H: hil::sensors::HumidityDriver<'a>> hil::sensors::HumidityClient
+    for HumiditySensor<'a, H>
+{
+    fn callback(&self, humidity_val: usize) {
+        self.busy.set(false);
+
         for cntr in self.apps.iter() {
             cntr.enter(|app, upcalls| {
                 if app.subscribed {
-                    self.busy.set(false);
                     app.subscribed = false;
-                    upcalls.schedule_upcall(0, (tmp_val, 0, 0)).ok();
+                    upcalls.schedule_upcall(0, (humidity_val, 0, 0)).ok();
                 }
             });
         }
     }
 }
 
-impl SyscallDriver for HumiditySensor<'_> {
+impl<'a, H: hil::sensors::HumidityDriver<'a>> SyscallDriver for HumiditySensor<'a, H> {
     fn command(
         &self,
         command_num: usize,
@@ -142,7 +145,7 @@ impl SyscallDriver for HumiditySensor<'_> {
         processid: ProcessId,
     ) -> CommandReturn {
         match command_num {
-            // check whether the driver exist!!
+            // driver existence check
             0 => CommandReturn::success(),
 
             // single humidity measurement

@@ -251,8 +251,8 @@ impl From<RPGpio> for ChannelNumber {
 
 /// Identifier for a channel pin
 ///
-/// Each PWM channel has two pins: A and B.  
-/// Pin A is always configured as an output pin.  
+/// Each PWM channel has two pins: A and B.
+/// Pin A is always configured as an output pin.
 /// Pin B is configured as an output pin when running in free running mode. Otherwise, it is
 /// configured as an input pin.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -627,7 +627,7 @@ impl<'a> Pwm<'a> {
     /// The returned structure can be used to control the PWM pin.
     ///
     /// See [PwmPin]
-    pub fn gpio_to_pwm_pin(&'a self, gpio: RPGpio) -> PwmPin {
+    pub fn gpio_to_pwm_pin(&'a self, gpio: RPGpio) -> PwmPin<'a> {
         let (channel_number, channel_pin) = self.gpio_to_pwm(gpio);
         self.new_pwm_pin(channel_number, channel_pin)
     }
@@ -680,7 +680,7 @@ impl<'a> Pwm<'a> {
     ) -> Result<(), ErrorCode> {
         let (top, int, frac) = match self.compute_top_int_frac(frequency_hz) {
             Ok(result) => result,
-            Err(_) => return Result::from(ErrorCode::INVAL),
+            Err(()) => return Result::from(ErrorCode::INVAL),
         };
 
         let max_duty_cycle = hil::pwm::Pwm::get_maximum_duty_cycle(self);
@@ -881,34 +881,37 @@ impl hil::pwm::PwmPin for PwmPin<'_> {
 /// If everything goes right, the following output should be displayed:
 ///
 /// ```txt
-/// Testing ChannelNumber enum...  
-/// ChannelNumber enum OK  
-/// Testing ChannelPin enum...  
-/// ChannelPin enum OK  
-/// Testing PWM struct...  
-/// Starting testing channel 1...  
-/// Channel 1 works!  
-/// Starting testing channel 2...  
-/// Channel 2 works!  
-/// Starting testing channel 3...  
-/// Channel 3 works!  
-/// Starting testing channel 4...  
-/// Channel 4 works!  
-/// Starting testing channel 5...  
-/// Channel 5 works!  
-/// Starting testing channel 6...  
-/// Channel 6 works!  
-/// Starting testing channel 7...  
-/// Channel 7 works!  
-/// PWM struct OK  
+/// Testing ChannelNumber enum...
+/// ChannelNumber enum OK
+/// Testing ChannelPin enum...
+/// ChannelPin enum OK
+/// Testing PWM struct...
+/// Starting testing channel 1...
+/// Channel 1 works!
+/// Starting testing channel 2...
+/// Channel 2 works!
+/// Starting testing channel 3...
+/// Channel 3 works!
+/// Starting testing channel 4...
+/// Channel 4 works!
+/// Starting testing channel 5...
+/// Channel 5 works!
+/// Starting testing channel 6...
+/// Channel 6 works!
+/// Starting testing channel 7...
+/// Channel 7 works!
+/// PWM struct OK
 /// Testing PwmPinStruct...
 /// PwmPin struct OK
-/// Testing PWM HIL trait...  
+/// Testing PWM HIL trait...
 /// PWM HIL trait OK
 /// ```
 
 pub mod unit_tests {
-    use super::*;
+    use super::{
+        debug, hil, ChannelNumber, ChannelPin, DivMode, Pwm, RPGpio, Readable, CC, CH, CSR, CTR,
+        DIV, TOP,
+    };
 
     fn test_channel_number() {
         debug!("Testing ChannelNumber enum...");
@@ -1089,13 +1092,13 @@ pub mod unit_tests {
         // The counter must run at less than full speed (div_int + div_frac / 16 > 1) to pass
         // advance_count()
         pwm.set_div_mode(channel_number, DivMode::FreeRunning);
-        assert_eq!(pwm.advance_count(channel_number), true);
+        assert!(pwm.advance_count(channel_number));
         assert_eq!(pwm.get_counter(channel_number), 2);
         pwm.set_enabled(channel_number, true);
         // No assert for retard count since it is impossible to predict how much the counter
         // will advance while running. However, the fact that the function returns true is a
         // good indicator that it does its job.
-        assert_eq!(pwm.retard_count(channel_number), true);
+        assert!(pwm.retard_count(channel_number));
         // Disabling PWM to prevent it from generating interrupts signals for next tests
         pwm.set_enabled(channel_number, false);
 
@@ -1112,12 +1115,12 @@ pub mod unit_tests {
         pwm.enable_interrupt(channel_number);
         pwm.set_counter(channel_number, 12345);
         pwm.advance_count(channel_number);
-        assert_eq!(pwm.get_interrupt_status(channel_number), true);
+        assert!(pwm.get_interrupt_status(channel_number));
         pwm.disable_interrupt(channel_number);
 
         // Testing clear_interrupt()
         pwm.clear_interrupt(channel_number);
-        assert_eq!(pwm.get_interrupt_status(channel_number), false);
+        assert!(!pwm.get_interrupt_status(channel_number));
 
         // Testing force_interrupt(), unforce_interrupt()
         pwm.force_interrupt(channel_number);
@@ -1125,10 +1128,10 @@ pub mod unit_tests {
             pwm.registers.intf.read(CH::CH),
             1 << (channel_number as u32)
         );
-        assert_eq!(pwm.get_interrupt_status(channel_number), true);
+        assert!(pwm.get_interrupt_status(channel_number));
         pwm.unforce_interrupt(channel_number);
         assert_eq!(pwm.registers.intf.read(CH::CH), 0);
-        assert_eq!(pwm.get_interrupt_status(channel_number), false);
+        assert!(!pwm.get_interrupt_status(channel_number));
 
         debug!("Channel {} works!", channel_number as usize);
     }

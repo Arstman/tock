@@ -6,7 +6,7 @@
 //!
 //! This is a async implementation of the SipHash.
 //!
-//! This capsule was originally written to be used as part of Tocks
+//! This capsule was originally written to be used as part of Tock's
 //! key/value store. SipHash was used as it is generally fast, while also
 //! being resilient against DOS attacks from userspace
 //! (unlike <https://github.com/servo/rust-fnv>).
@@ -15,7 +15,7 @@
 //! details on SipHash.
 //!
 //! The implementation is based on the Rust implementation from
-//! rust-core, avaliable here: <https://github.com/jedisct1/rust-siphash>
+//! rust-core, available here: <https://github.com/jedisct1/rust-siphash>
 //!
 //! Copyright 2012-2016 The Rust Project Developers.
 //! Copyright 2016-2021 Frank Denis.
@@ -27,14 +27,13 @@
 //! option.
 
 use core::cell::Cell;
-use core::convert::TryInto;
 use core::{cmp, mem};
 use kernel::deferred_call::{DeferredCall, DeferredCallClient};
 use kernel::hil::hasher::{Client, Hasher, SipHash};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::utilities::leasable_buffer::LeasableBuffer;
-use kernel::utilities::leasable_buffer::LeasableBufferDynamic;
-use kernel::utilities::leasable_buffer::LeasableMutableBuffer;
+use kernel::utilities::leasable_buffer::SubSlice;
+use kernel::utilities::leasable_buffer::SubSliceMut;
+use kernel::utilities::leasable_buffer::SubSliceMutImmut;
 use kernel::ErrorCode;
 
 pub struct SipHasher24<'a> {
@@ -46,7 +45,7 @@ pub struct SipHasher24<'a> {
     complete_deferred_call: Cell<bool>,
     deferred_call: DeferredCall,
 
-    data_buffer: Cell<Option<LeasableBufferDynamic<'static, u8>>>,
+    data_buffer: Cell<Option<SubSliceMutImmut<'static, u8>>>,
     out_buffer: TakeCell<'static, [u8; 8]>,
 }
 
@@ -72,7 +71,7 @@ struct State {
     v3: u64,
 }
 
-impl<'a> SipHasher24<'a> {
+impl SipHasher24<'_> {
     pub fn new() -> Self {
         let hasher = SipHasher {
             k0: 0,
@@ -149,8 +148,11 @@ macro_rules! compress {
 }
 
 fn read_le_u64(input: &[u8]) -> u64 {
-    let (int_bytes, _rest) = input.split_at(mem::size_of::<u64>());
-    u64::from_le_bytes(int_bytes.try_into().unwrap())
+    let mut eight_buf: [u8; 8] = [0; 8];
+    for i in 0..8 {
+        eight_buf[i] = *input.get(i).unwrap_or(&0);
+    }
+    u64::from_le_bytes(eight_buf)
 }
 
 fn read_le_u16(input: &[u8]) -> u16 {
@@ -172,7 +174,7 @@ fn u8to64_le(buf: &[u8], start: usize, len: usize) -> u64 {
         i += 2
     }
     if i < len {
-        out |= (*buf.get(start + i).unwrap() as u64) << (i * 8);
+        out |= (buf[start + i] as u64) << (i * 8);
         i += 1;
     }
     debug_assert_eq!(i, len);
@@ -186,10 +188,9 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
 
     fn add_data(
         &self,
-        data: LeasableBuffer<'static, u8>,
-    ) -> Result<usize, (ErrorCode, &'static [u8])> {
+        data: SubSlice<'static, u8>,
+    ) -> Result<usize, (ErrorCode, SubSlice<'static, u8>)> {
         let length = data.len();
-        let msg = data.take();
         let mut hasher = self.hasher.get();
 
         hasher.length += length;
@@ -198,7 +199,8 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
 
         if hasher.ntail != 0 {
             needed = 8 - hasher.ntail;
-            hasher.tail |= u8to64_le(msg, 0, cmp::min(length, needed)) << (8 * hasher.ntail);
+            hasher.tail |=
+                u8to64_le(data.as_slice(), 0, cmp::min(length, needed)) << (8 * hasher.ntail);
             if length < needed {
                 hasher.ntail += length;
                 return Ok(length);
@@ -217,7 +219,7 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
 
         let mut i = needed;
         while i < len - left {
-            let mi = read_le_u64(&msg[i..]);
+            let mi = read_le_u64(&data[i..]);
 
             hasher.state.v3 ^= mi;
             compress!(&mut hasher.state);
@@ -227,14 +229,12 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
             i += 8;
         }
 
-        hasher.tail = u8to64_le(msg, i, left);
+        hasher.tail = u8to64_le(data.as_slice(), i, left);
         hasher.ntail = left;
 
         self.hasher.set(hasher);
         self.data_buffer
-            .set(Some(LeasableBufferDynamic::Immutable(LeasableBuffer::new(
-                msg,
-            ))));
+            .set(Some(SubSliceMutImmut::Immutable(data)));
 
         self.add_data_deferred_call.set(true);
         self.deferred_call.set();
@@ -244,10 +244,9 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
 
     fn add_mut_data(
         &self,
-        data: LeasableMutableBuffer<'static, u8>,
-    ) -> Result<usize, (ErrorCode, &'static mut [u8])> {
+        mut data: SubSliceMut<'static, u8>,
+    ) -> Result<usize, (ErrorCode, SubSliceMut<'static, u8>)> {
         let length = data.len();
-        let msg = data.take();
         let mut hasher = self.hasher.get();
 
         hasher.length += length;
@@ -256,7 +255,8 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
 
         if hasher.ntail != 0 {
             needed = 8 - hasher.ntail;
-            hasher.tail |= u8to64_le(msg, 0, cmp::min(length, needed)) << (8 * hasher.ntail);
+            hasher.tail |=
+                u8to64_le(data.as_slice(), 0, cmp::min(length, needed)) << (8 * hasher.ntail);
             if length < needed {
                 hasher.ntail += length;
                 return Ok(length);
@@ -275,7 +275,7 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
 
         let mut i = needed;
         while i < len - left {
-            let mi = read_le_u64(&msg[i..]);
+            let mi = read_le_u64(&data[i..]);
 
             hasher.state.v3 ^= mi;
             compress!(&mut hasher.state);
@@ -285,13 +285,11 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
             i += 8;
         }
 
-        hasher.tail = u8to64_le(msg, i, left);
+        hasher.tail = u8to64_le(data.as_slice(), i, left);
         hasher.ntail = left;
 
         self.hasher.set(hasher);
-        self.data_buffer.set(Some(LeasableBufferDynamic::Mutable(
-            LeasableMutableBuffer::new(msg),
-        )));
+        self.data_buffer.set(Some(SubSliceMutImmut::Mutable(data)));
 
         self.add_data_deferred_call.set(true);
         self.deferred_call.set();
@@ -341,7 +339,7 @@ impl<'a> Hasher<'a, 8> for SipHasher24<'a> {
     }
 }
 
-impl<'a> SipHash for SipHasher24<'a> {
+impl SipHash for SipHasher24<'_> {
     fn set_keys(&self, k0: u64, k1: u64) -> Result<(), ErrorCode> {
         let mut hasher = self.hasher.get();
 
@@ -355,15 +353,15 @@ impl<'a> SipHash for SipHasher24<'a> {
     }
 }
 
-impl<'a> DeferredCallClient for SipHasher24<'a> {
+impl DeferredCallClient for SipHasher24<'_> {
     fn handle_deferred_call(&self) {
         if self.add_data_deferred_call.get() {
             self.add_data_deferred_call.set(false);
 
             self.client.map(|client| {
                 self.data_buffer.take().map(|buffer| match buffer {
-                    LeasableBufferDynamic::Immutable(b) => client.add_data_done(Ok(()), b.take()),
-                    LeasableBufferDynamic::Mutable(b) => client.add_mut_data_done(Ok(()), b.take()),
+                    SubSliceMutImmut::Immutable(b) => client.add_data_done(Ok(()), b),
+                    SubSliceMutImmut::Mutable(b) => client.add_mut_data_done(Ok(()), b),
                 });
             });
         }

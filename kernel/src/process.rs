@@ -6,6 +6,7 @@
 
 use core::fmt;
 use core::fmt::Write;
+use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use core::str;
 
@@ -18,26 +19,29 @@ use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
 use crate::storage_permissions;
 use crate::syscall::{self, Syscall, SyscallReturn};
 use crate::upcall::UpcallId;
-use tock_tbf::types::{CommandPermissions, TbfFooterV2Credentials};
+use crate::utilities::capability_ptr::CapabilityPtr;
+use tock_tbf::types::CommandPermissions;
 
 // Export all process related types via `kernel::process::`.
+pub use crate::process_binary::ProcessBinary;
+pub use crate::process_checker::AcceptedCredential;
+pub use crate::process_checker::{ProcessCheckerMachine, ProcessCheckerMachineClient};
+pub use crate::process_loading::load_processes;
 pub use crate::process_loading::ProcessLoadError;
-pub use crate::process_loading::{load_and_check_processes, load_processes};
-pub use crate::process_policies::{
-    PanicFaultPolicy, ProcessFaultPolicy, RestartFaultPolicy, StopFaultPolicy,
-    StopWithDebugFaultPolicy, ThresholdRestartFaultPolicy, ThresholdRestartThenPanicFaultPolicy,
-};
-pub use crate::process_printer::{ProcessPrinter, ProcessPrinterContext, ProcessPrinterText};
+pub use crate::process_loading::SequentialProcessLoaderMachine;
+pub use crate::process_loading::{ProcessLoadingAsync, ProcessLoadingAsyncClient};
+pub use crate::process_policies::{ProcessFaultPolicy, ProcessStandardStoragePermissionsPolicy};
+pub use crate::process_printer::{ProcessPrinter, ProcessPrinterContext};
 pub use crate::process_standard::ProcessStandard;
+pub use crate::process_standard::{ProcessStandardDebug, ProcessStandardDebugFull};
 
 /// Userspace process identifier.
 ///
-/// This is an opaque type that can be used to represent a running
-/// process on the board without requiring an actual reference to a
-/// `Process` object. Having this `ProcessId` reference type is useful
-/// for managing ownership and type issues in Rust, but more
-/// importantly `ProcessId` serves as a tool for capsules to hold
-/// pointers to applications.
+/// This is an opaque type that can be used to represent a running process on
+/// the board without requiring an actual reference to a `Process` object.
+/// Having this `ProcessId` reference type is useful for managing ownership and
+/// type issues in Rust, but more importantly `ProcessId` serves as a tool for
+/// capsules to hold pointers to applications.
 ///
 /// Since `ProcessId` implements `Copy`, having an `ProcessId` does _not_ ensure
 /// that the process the `ProcessId` refers to is still valid. The process may
@@ -124,9 +128,9 @@ impl ProcessId {
     /// index in the processes array.
     pub(crate) fn new(kernel: &'static Kernel, identifier: usize, index: usize) -> ProcessId {
         ProcessId {
-            kernel: kernel,
-            identifier: identifier,
-            index: index,
+            kernel,
+            index,
+            identifier,
         }
     }
 
@@ -142,9 +146,9 @@ impl ProcessId {
         _capability: &dyn capabilities::ExternalProcessCapability,
     ) -> ProcessId {
         ProcessId {
-            kernel: kernel,
-            identifier: identifier,
-            index: index,
+            kernel,
+            index,
+            identifier,
         }
     }
 
@@ -174,10 +178,25 @@ impl ProcessId {
     /// Note, this will always return the saved unique identifier for the app
     /// originally referred to, even if that app no longer exists. For example,
     /// the app may have restarted, or may have been ended or removed by the
-    /// kernel. Therefore, calling `id()` is _not_ a valid way to check
-    /// that an application still exists.
+    /// kernel. Therefore, calling `id()` is _not_ a valid way to check that an
+    /// application still exists.
     pub fn id(&self) -> usize {
         self.identifier
+    }
+
+    /// Get the `ShortId` for this application this process is an execution of.
+    ///
+    /// The `ShortId` is an identifier for the _application_, not the particular
+    /// execution (i.e. the currently running process). This makes `ShortId`
+    /// distinct from `ProcessId`.
+    ///
+    /// This function is a helper function as capsules typically use `ProcessId`
+    /// as a handle to the running process and corresponding app.
+    pub fn short_app_id(&self) -> ShortId {
+        self.kernel
+            .process_map_or(ShortId::LocallyUnique, *self, |process| {
+                process.short_app_id()
+            })
     }
 
     /// Returns the full address of the start and end of the flash region that
@@ -195,27 +214,117 @@ impl ProcessId {
     /// what the process is allowed to read and write. Returns `None` if the
     /// process has no storage permissions.
     pub fn get_storage_permissions(&self) -> Option<storage_permissions::StoragePermissions> {
-        self.kernel
-            .process_map_or(None, *self, |process| process.get_storage_permissions())
+        self.kernel.process_map_or(None, *self, |process| {
+            Some(process.get_storage_permissions())
+        })
     }
 }
 
-/// A compressed form of an Application Identifer.
+/// A compressed form of an Application Identifier.
+///
+/// ShortIds are useful for more efficient operations with app identifiers
+/// within the kernel. They are guaranteed to be unique among all running
+/// processes on the same board. However, as they are only 32 bits they are not
+/// globally unique.
+///
+/// ShortIds are persistent across restarts of the same app (whereas ProcessIDs
+/// are not).
+///
+/// As ShortIds must be unique for each app on a board, and since not every
+/// platform may have a use for ShortIds, the definition of a ShortId provides a
+/// convenient mechanism for meeting the uniqueness requirement without actually
+/// requiring assigning unique discrete values to each app. This is done with
+/// the `LocallyUnique` variant which is an abstract ID that is guaranteed to be
+/// unique (i.e. an equality comparison with any other ShortId will always
+/// return `false`). Platforms which have a use for an actual number for a
+/// `ShortId` should use the `Fixed(NonZeroU32)` variant. Note, for type space
+/// efficiency, we disallow using the number 0 as a fixed ShortId.
+///
+/// ShortIds are assigned to the app as part of the credential checking process.
+/// Specifically, an implementation of the `process_checker::Compress` trait
+/// assigns ShortIds.
 #[derive(Clone, Copy)]
-pub enum ShortID {
+pub enum ShortId {
+    /// An abstract `ShortId` that is always guaranteed to be unique. As this is
+    /// not an actual discrete value, it cannot be used for anything other than
+    /// meeting the uniqueness requirement.
     LocallyUnique,
+    /// A 32 bit number `ShortId`. This fixed value is guaranteed to be unique
+    /// among all running processes as the kernel will not start two processes
+    /// with the same ShortId.
     Fixed(core::num::NonZeroU32),
 }
 
-impl PartialEq for ShortID {
+impl PartialEq for ShortId {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (ShortID::Fixed(a), ShortID::Fixed(b)) => a == b,
+            (ShortId::Fixed(a), ShortId::Fixed(b)) => a == b,
             _ => false,
         }
     }
 }
-impl Eq for ShortID {}
+impl Eq for ShortId {}
+
+impl core::convert::From<Option<core::num::NonZeroU32>> for ShortId {
+    fn from(id: Option<core::num::NonZeroU32>) -> ShortId {
+        match id {
+            Some(fixed) => ShortId::Fixed(fixed),
+            None => ShortId::LocallyUnique,
+        }
+    }
+}
+
+impl core::fmt::Display for ShortId {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> fmt::Result {
+        match *self {
+            ShortId::LocallyUnique => {
+                write!(fmt, "Unique")
+            }
+            ShortId::Fixed(id) => {
+                write!(fmt, "0x{:<8x} ", id)
+            }
+        }
+    }
+}
+
+/// Enum used to inform scheduler why a process stopped executing (aka why
+/// `do_process()` returned).
+///
+/// This is publicly exported to allow for schedulers implemented outside of the
+/// kernel crate.
+#[derive(PartialEq, Eq)]
+pub enum StoppedExecutingReason {
+    /// The process returned because it is no longer ready to run.
+    NoWorkLeft,
+
+    /// The process faulted, and the board restart policy was configured such
+    /// that it was not restarted and there was not a kernel panic.
+    StoppedFaulted,
+
+    /// The kernel stopped the process.
+    Stopped,
+
+    /// The process was preempted because its timeslice expired.
+    TimesliceExpired,
+
+    /// The process returned because it was preempted by the kernel. This can
+    /// mean that kernel work became ready (most likely because an interrupt
+    /// fired and the kernel thread needs to execute the bottom half of the
+    /// interrupt), or because the scheduler no longer wants to execute that
+    /// process.
+    KernelPreemption,
+}
+
+/// The version of a binary.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct BinaryVersion(NonZeroU32);
+
+impl BinaryVersion {
+    /// Creates a new binary version.
+    pub fn new(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+}
 
 /// This trait represents a generic process that the Tock scheduler can
 /// schedule.
@@ -223,95 +332,93 @@ pub trait Process {
     /// Returns the process's identifier.
     fn processid(&self) -> ProcessId;
 
-    /// Returns the ShortID generated by the application binary
-    /// checker at loading.
-    fn short_app_id(&self) -> ShortID;
+    /// Returns the [`ShortId`] generated by the application binary checker at
+    /// loading.
+    fn short_app_id(&self) -> ShortId;
 
-    /// Returns the version number of the binary in this process,
-    /// as specified in a TBF Program Header; if the Userspace Binary
-    /// only has a TBF Main Header, returns 0.
-    fn binary_version(&self) -> u32;
+    /// Returns the version number of the binary in this process, as specified
+    /// in a TBF Program Header. If the binary has no version assigned this
+    /// returns [`None`].
+    fn binary_version(&self) -> Option<BinaryVersion>;
 
-    /// Queue a `Task` for the process. This will be added to a per-process
-    /// buffer and executed by the scheduler. `Task`s are some function the app
-    /// should run, for example a upcall or an IPC call.
-    ///
-    /// This function returns `Ok(())` if the `Task` was successfully
-    /// enqueued. If the process is no longer alive,
-    /// `Err(ErrorCode::NODEVICE)` is returned. If the task could not
-    /// be enqueued because there is insufficient space in the
-    /// internal task queue, `Err(ErrorCode::NOMEM)` is
-    /// returned. Other return values must be treated as
-    /// kernel-internal errors.
-    fn enqueue_task(&self, task: Task) -> Result<(), ErrorCode>;
+    /// Return the credential which the credential checker approved if the
+    /// credential checker approved a credential. If the process was allowed to
+    /// run without credentials, return `None`.
+    fn get_credential(&self) -> Option<AcceptedCredential>;
 
-    /// Enqueue a `Task` to execute the init function of the process.
-    /// The process must be in the the `Terminated` or
-    /// `CredentialsApproved` state, and invoking this method
-    /// transitions it to the `Yielded` state before enqueuing the
-    /// task. This is the only method that transitions a process from
-    /// `Terminated` or `CredentialsApproved` to `Yielded`. Because
-    /// starting a process has security implications (e.g., that every
-    /// running process has a unique application identifier), this
-    /// method requires a Capability.
-    fn enqueue_init_task(
-        &self,
-        cap: &dyn capabilities::ProcessInitCapability,
-    ) -> Result<(), ErrorCode>;
+    /// Returns how many times this process has been restarted.
+    fn get_restart_count(&self) -> usize;
 
-    /// Transition a loaded but unchecked process into the
-    /// `CredentialsApproved` state so it can run. Returns an error if
-    /// the process was not in the `Unchecked` state. The
-    /// `credentials` argument is `None` if all credentials are Pass;
-    /// if a credential is Accept, it is passed in `credentials`.  The
-    /// `short_app_id` argument is the short ID generated by the
-    /// Identifier Policy. Transitioning a process to
-    /// `CredentialsApproved` has security implications because it
-    /// means this application binary is permitted to run on the
-    /// system. This method therefore requires a Capability.
-    fn mark_credentials_pass(
-        &self,
-        credentials: Option<TbfFooterV2Credentials>,
-        short_app_id: ShortID,
-        capability: &dyn capabilities::ProcessApprovalCapability,
-    ) -> Result<(), ErrorCode>;
+    /// Get the name of the process. Used for IPC.
+    fn get_process_name(&self) -> &'static str;
 
-    /// Transition a process into the `CredentialsFailed` state, indicating
-    /// it should never run.
-    fn mark_credentials_fail(&self, capability: &dyn capabilities::ProcessApprovalCapability);
-
-    /// Return the credentials which have made this process runnable, or
-    /// `None` if it was not made runnable or allowed to run without credentials.
-    fn get_credentials(&self) -> Option<TbfFooterV2Credentials>;
-
-    /// Returns whether this process is ready to execute.
-    fn ready(&self) -> bool;
-
-    /// Return if there are any Tasks (upcalls/IPC requests) enqueued
-    /// for the process.
+    /// Return if there are any Tasks (upcalls/IPC requests) enqueued for the
+    /// process.
     fn has_tasks(&self) -> bool;
-
-    /// Remove the scheduled operation from the front of the queue and return it
-    /// to be handled by the scheduler.
-    ///
-    /// If there are no `Task`s in the queue for this process this will return
-    /// `None`.
-    fn dequeue_task(&self) -> Option<Task>;
 
     /// Returns the number of pending tasks. If 0 then `dequeue_task()` will
     /// return `None` when called.
     fn pending_tasks(&self) -> usize;
 
-    /// Remove all scheduled upcalls for a given upcall id from the task
-    /// queue.
-    fn remove_pending_upcalls(&self, upcall_id: UpcallId);
+    /// Queue a [`Task`] for the process. This will be added to a per-process
+    /// buffer and executed by the scheduler. [`Task`]s are some function the
+    /// process should run, for example a upcall or an IPC call.
+    ///
+    /// This function returns:
+    /// - `Ok(())` if the [`Task`] was successfully enqueued.
+    /// - [`Err(ErrorCode::NODEVICE)`] if the process is no longer alive.
+    /// - [`Err(ErrorCode::NOMEM)`] if the task could not be enqueued because
+    ///   there is insufficient space in the internal task queue.
+    ///
+    /// Other return values must be treated as kernel-internal errors.
+    fn enqueue_task(&self, task: Task) -> Result<(), ErrorCode>;
 
-    /// Returns the current state the process is in. Common states are "running"
-    /// or "yielded".
+    /// Remove the scheduled operation from the front of the queue and return it
+    /// to be handled by the scheduler.
+    ///
+    /// If there are no [`Task`]s in the queue for this process this will return
+    /// [`None`].
+    fn dequeue_task(&self) -> Option<Task>;
+
+    /// Search the work queue for the first pending operation with the given
+    /// `upcall_id` and if one exists remove it from the queue.process
+    ///
+    /// ## Returns
+    ///
+    /// Returns the associated [`Task`] if one was found, otherwise returns
+    /// [`None`].
+    fn remove_upcall(&self, upcall_id: UpcallId) -> Option<Task>;
+
+    /// Remove all scheduled upcalls with the given `upcall_id` from the task
+    /// queue.
+    ///
+    /// Returns the number of removed upcalls.
+    fn remove_pending_upcalls(&self, upcall_id: UpcallId) -> usize;
+
+    /// Returns the current state the process is in.
     fn get_state(&self) -> State;
 
-    /// Returns whether the process is running (has active stack frames)
-    /// or not (has never run, has faulted, or has completed).
+    /// Returns whether this process is ready to execute.
+    ///
+    /// A process is ready if it has work to do or if it was interrupted while
+    /// executing and can continue to execute.
+    ///
+    /// ## Returns
+    ///
+    /// `true` if the process is ready and `false` otherwise.
+    fn ready(&self) -> bool;
+
+    /// Returns whether the process is running or not.
+    ///
+    /// A process is considered running if it is active and has active stack
+    /// frames. A running process can be executed.
+    ///
+    /// A process that is not running cannot be executed. The process may have
+    /// faulted or it may have completed.
+    ///
+    /// ## Returns
+    ///
+    /// `true` if the process is running and `false` otherwise.
     fn is_running(&self) -> bool;
 
     /// Move this process from the running state to the yielded state.
@@ -319,6 +426,12 @@ pub trait Process {
     /// This will fail (i.e. not do anything) if the process was not previously
     /// running.
     fn set_yielded_state(&self);
+
+    /// Move this process from the running state to the yielded-for state.
+    ///
+    /// This will fail (i.e. not do anything) if the process was not previously
+    /// running.
+    fn set_yielded_for_state(&self, upcall_id: UpcallId);
 
     /// Move this process from running or yielded state into the stopped state.
     ///
@@ -328,21 +441,78 @@ pub trait Process {
 
     /// Move this stopped process back into its original state.
     ///
-    /// This transitions a process from `StoppedRunning` -> `Running` or
-    /// `StoppedYielded` -> `Yielded`.
+    /// This transitions a process from
+    /// [`Stopped`](State::Stopped) to [`Running`](State::Running), [`Yielded`](State::Running) or
+    /// [`YieldedFor`](State::YieldedFor).
+    ///
+    /// This will fail (i.e. not do anything) if the process was not stopped.
     fn resume(&self);
 
-    /// Put this process in the fault state. This will trigger the
-    /// `FaultResponse` for this process to occur.
+    /// Put this process in the fault state.
+    ///
+    /// The kernel will use the process's fault policy to decide what action to
+    /// take in regards to the faulted process.
     fn set_fault_state(&self);
 
-    /// Returns how many times this process has been restarted.
-    fn get_restart_count(&self) -> usize;
+    /// Start a terminated process. This function can only be called on a
+    /// terminated process.
+    ///
+    /// The caller MUST verify this process is unique before calling this
+    /// function. This requires a capability to call to ensure that the caller
+    /// have verified that this process is unique before trying to start it.
+    fn start(&self, cap: &dyn crate::capabilities::ProcessStartCapability);
 
-    /// Get the name of the process. Used for IPC.
-    fn get_process_name(&self) -> &'static str;
+    /// Terminates and attempts to restart the process. The process and current
+    /// application always terminate. The kernel may, based on its own policy,
+    /// restart the application using the same process, reuse the process for
+    /// another application, or simply terminate the process and application.
+    ///
+    /// This function can be called when the process is in any state except for
+    /// [`Terminated`](State::Terminated). It attempts to reset all process
+    /// state and re-initialize it so that it can be reused.
+    ///
+    /// Restarting an application can fail for three general reasons:
+    ///
+    /// 1. The process is already terminated. Use [`Process::start()`] instead.
+    ///
+    /// 2. The kernel chooses not to restart the application, based on its
+    ///    policy.
+    ///
+    /// 3. The kernel decides to restart the application but fails to do so
+    ///    because some state can no long be configured for the process. For
+    ///    example, the syscall state for the process fails to initialize.
+    ///
+    /// After `try_restart()` runs, the process will either be queued to run the
+    /// same application's `_start` function, terminated, or queued to run a
+    /// different application's `_start` function.
+    ///
+    /// As the process will be terminated before being restarted, this function
+    /// accepts an optional `completion_code`. If the process provided a
+    /// completion code (e.g. via the exit syscall), then this should be called
+    /// with `Some(u32)`. If the kernel is trying to restart the process and the
+    /// process did not provide a completion code, then this should be called
+    /// with `None`.
+    fn try_restart(&self, completion_code: Option<u32>);
+
+    /// Stop and clear a process's state and put it into the
+    /// [`Terminated`](State::Terminated) state.
+    ///
+    /// This will end the process, but does not reset it such that it could be
+    /// restarted and run again. This function instead frees grants and any
+    /// queued tasks for this process, but leaves the debug information about
+    /// the process and other state intact.
+    ///
+    /// When a process is terminated, an optional `completion_code` should be
+    /// stored for the process. If the process provided the completion code
+    /// (e.g. via the exit syscall), then this function should be called with a
+    /// completion code of `Some(u32)`. If the kernel is terminating the process
+    /// and therefore has no completion code from the process, it should provide
+    /// `None`.
+    fn terminate(&self, completion_code: Option<u32>);
 
     /// Get the completion code if the process has previously terminated.
+    ///
+    /// ## Returns
     ///
     /// If the process has never terminated then there has been no opportunity
     /// for a completion code to be set, and this will return `None`.
@@ -354,79 +524,66 @@ pub trait Process {
     /// this will return `Some(Some(completion_code))`.
     fn get_completion_code(&self) -> Option<Option<u32>>;
 
-    /// Stop and clear a process's state. If the process was running
-    /// or has passed credentials checks, put it into the `Terminated`
-    /// state. This method has no effect on processes in the
-    /// `CredentialsFailed` state.
-    ///
-    /// This will end the process, but does not reset it such that it could be
-    /// restarted and run again. This function instead frees grants and any
-    /// queued tasks for this process, but leaves the debug information about
-    /// the process and other state intact.
-    ///
-    /// When a process is terminated, an optional `completion_code` should be
-    /// stored for the process. If the process provided the completion code
-    /// (e.g. via the exit syscall), then this function should be called with
-    /// a completion code of `Some(u32)`. If the kernel is terminating the
-    /// process and therefore has no completion code from the process, it should
-    /// provide `None`.
-    fn terminate(&self, completion_code: Option<u32>);
-
-    /// Terminates and attempts to restart the process. The process and current
-    /// application always terminate. The kernel may, based on its own policy,
-    /// restart the application using the same process, reuse the process for
-    /// another application, or simply terminate the process and application.
-    ///
-    /// This function can be called when the process is in any state. It
-    /// attempts to reset all process state and re-initialize it so that it can
-    /// be reused.
-    ///
-    /// Restarting an application can fail for two general reasons:
-    ///
-    /// 1. The kernel chooses not to restart the application, based on its
-    ///    policy.
-    ///
-    /// 2. The kernel decides to restart the application but fails to do so
-    ///    because Some state can no long be configured for the process. For
-    ///    example, the syscall state for the process fails to initialize.
-    ///
-    /// After `restart()` runs the process will either be queued to run its the
-    /// application's `_start` function, terminated, or queued to run a
-    /// different application's `_start` function.
-    ///
-    /// As the process will be terminated before being restarted, this function
-    /// accepts an optional `completion_code`. If the process provided a
-    /// completion code (e.g. via the exit syscall), then this should be called
-    /// with `Some(u32)`. If the kernel is trying to restart the process and the
-    /// process did not provide a completion code, then this should be called
-    /// with `None`.
-    fn try_restart(&self, completion_code: Option<u32>);
-
     // memop operations
 
-    /// Change the location of the program break and reallocate the MPU region
-    /// covering program memory.
+    /// Change the location of the program break to `new_break` and reallocate
+    /// the MPU region covering program memory.
     ///
-    /// This will fail with an error if the process is no longer active. An
-    /// inactive process will not run again without being reset, and changing
-    /// the memory pointers is not valid at this point.
-    fn brk(&self, new_break: *const u8) -> Result<*const u8, Error>;
+    /// ## Returns
+    ///
+    /// On success, return the previous break address with authority that
+    /// has RW permissions from the start of process RAM to the new break.
+    ///
+    /// On error, return:
+    /// - [`Error::InactiveApp`] if the process is not running and adjusting the
+    ///   memory pointers is not valid.
+    /// - [`Error::OutOfMemory`] if the requested break would overlap with the
+    ///   grant region or if the newly requested memory cannot be protected with
+    ///   the MPU.
+    /// - [`Error::AddressOutOfBounds`] if the requested break is beyond the
+    ///   process's memory region.
+    /// - [`Error::KernelError`] if there was an internal kernel error. This is
+    ///   a bug.
+    fn brk(&self, new_break: *const u8) -> Result<CapabilityPtr, Error>;
 
-    /// Change the location of the program break, reallocate the MPU region
-    /// covering program memory, and return the previous break address.
+    /// Change the location of the program break by `increment` bytes,
+    /// reallocate the MPU region covering program memory, and return the
+    /// previous break address.
     ///
-    /// This will fail with an error if the process is no longer active. An
-    /// inactive process will not run again without being reset, and changing
-    /// the memory pointers is not valid at this point.
-    fn sbrk(&self, increment: isize) -> Result<*const u8, Error>;
+    /// ## Returns
+    ///
+    /// On success, return the previous break address with authority that
+    /// has RW permissions from the start of process RAM to the new break.
+    ///
+    /// On error, return:
+    /// - [`Error::InactiveApp`] if the process is not running and adjusting the
+    ///   sbrk is not valid.
+    /// - [`Error::OutOfMemory`] if the requested break would overlap with the
+    ///   grant region or if the newly requested memory cannot be protected with
+    ///   the MPU.
+    /// - [`Error::AddressOutOfBounds`] if the requested break is beyond the
+    ///   process's memory region.
+    /// - [`Error::KernelError`] if there was an internal kernel error. This is
+    ///   a bug.
+    fn sbrk(&self, increment: isize) -> Result<CapabilityPtr, Error>;
 
     /// How many writeable flash regions defined in the TBF header for this
     /// process.
+    ///
+    /// ## Returns
+    ///
+    /// The number of writeable flash regions defined for this process.
     fn number_writeable_flash_regions(&self) -> usize;
 
     /// Get the offset from the beginning of flash and the size of the defined
     /// writeable flash region.
-    fn get_writeable_flash_region(&self, region_index: usize) -> (u32, u32);
+    ///
+    /// ## Returns
+    ///
+    /// A tuple containing the a `usize` of the offset from the beginning of the
+    /// process's flash region where the writeable region starts and a `usize` of
+    /// the size of the region in bytes.
+    fn get_writeable_flash_region(&self, region_index: usize) -> (usize, usize);
 
     /// Debug function to update the kernel on where the stack starts for this
     /// process. Processes are not required to call this through the memop
@@ -445,11 +602,11 @@ pub trait Process {
     /// In case of success, this method returns the created
     /// [`ReadWriteProcessBuffer`].
     ///
-    /// In case of an error, an appropriate ErrorCode is returned:
+    /// In case of an error, an appropriate `ErrorCode` is returned:
     ///
     /// - If the memory is not contained in the process-accessible memory space
     ///   / `buf_start_addr` and `size` are not a valid read-write buffer (any
-    ///   byte in the range is not read/write accessible to the process),
+    ///   byte in the range is not read/write accessible to the process):
     ///   [`ErrorCode::INVAL`].
     /// - If the process is not active: [`ErrorCode::FAIL`].
     /// - For all other errors: [`ErrorCode::FAIL`].
@@ -471,7 +628,7 @@ pub trait Process {
     ///
     /// - If the memory is not contained in the process-accessible memory space
     ///   / `buf_start_addr` and `size` are not a valid read-only buffer (any
-    ///   byte in the range is not read-accessible to the process),
+    ///   byte in the range is not read-accessible to the process):
     ///   [`ErrorCode::INVAL`].
     /// - If the process is not active: [`ErrorCode::FAIL`].
     /// - For all other errors: [`ErrorCode::FAIL`].
@@ -499,13 +656,14 @@ pub trait Process {
     /// The returned `CommandPermissions` will indicate if any permissions for
     /// individual command numbers are specified. If there are permissions set
     /// they are returned as a 64 bit bitmask for sequential command numbers.
-    /// The offset indicates the multiple of 64 command numbers to get permissions for.
+    /// The offset indicates the multiple of 64 command numbers to get
+    /// permissions for.
     fn get_command_permissions(&self, driver_num: usize, offset: usize) -> CommandPermissions;
 
     /// Get the storage permissions for the process.
     ///
     /// Returns `None` if the process has no storage permissions.
-    fn get_storage_permissions(&self) -> Option<storage_permissions::StoragePermissions>;
+    fn get_storage_permissions(&self) -> storage_permissions::StoragePermissions;
 
     // mpu
 
@@ -528,8 +686,8 @@ pub trait Process {
         min_region_size: usize,
     ) -> Option<mpu::Region>;
 
-    /// Removes an MPU region from the process that has been previouly added with
-    /// `add_mpu_region`.
+    /// Removes an MPU region from the process that has been previously added
+    /// with `add_mpu_region`.
     ///
     /// It is not valid to call this function when the process is inactive (i.e.
     /// the process will not run again).
@@ -540,13 +698,13 @@ pub trait Process {
     /// Allocate memory from the grant region and store the reference in the
     /// proper grant pointer index.
     ///
-    /// This function must check that doing the allocation does not cause
-    /// the kernel memory break to go below the top of the process accessible
-    /// memory region allowed by the MPU. Note, this can be different from the
-    /// actual app_brk, as MPU alignment and size constraints may result in the
-    /// MPU enforced region differing from the app_brk.
+    /// This function must check that doing the allocation does not cause the
+    /// kernel memory break to go below the top of the process accessible memory
+    /// region allowed by the MPU. Note, this can be different from the actual
+    /// app_brk, as MPU alignment and size constraints may result in the MPU
+    /// enforced region differing from the app_brk.
     ///
-    /// This will return `false` and fail if:
+    /// This will return `Err(())` and fail if:
     /// - The process is inactive, or
     /// - There is not enough available memory to do the allocation, or
     /// - The grant_num is invalid, or
@@ -557,7 +715,7 @@ pub trait Process {
         driver_num: usize,
         size: usize,
         align: usize,
-    ) -> bool;
+    ) -> Result<(), ()>;
 
     /// Check if a given grant for this process has been allocated.
     ///
@@ -570,14 +728,14 @@ pub trait Process {
     /// are not recorded in the grant pointer array, but are useful for capsules
     /// which need additional process-specific dynamically allocated memory.
     ///
-    /// If successful, return a Some() with an identifier that can be used with
+    /// If successful, return a Ok() with an identifier that can be used with
     /// `enter_custom_grant()` to get access to the memory and the pointer to
     /// the memory which must be used to initialize the memory.
     fn allocate_custom_grant(
         &self,
         size: usize,
         align: usize,
-    ) -> Option<(ProcessCustomGrantIdentifier, NonNull<u8>)>;
+    ) -> Result<(ProcessCustomGrantIdentifier, NonNull<u8>), ()>;
 
     /// Enter the grant based on `grant_num` for this process.
     ///
@@ -595,8 +753,8 @@ pub trait Process {
     /// This retrieves a pointer to the previously allocated custom grant based
     /// on the identifier returned when the custom grant was allocated.
     ///
-    /// This returns an error if the custom grant is no longer accessible, or
-    /// if the process is inactive.
+    /// This returns an error if the custom grant is no longer accessible, or if
+    /// the process is inactive.
     fn enter_custom_grant(
         &self,
         identifier: ProcessCustomGrantIdentifier,
@@ -620,8 +778,8 @@ pub trait Process {
     unsafe fn leave_grant(&self, grant_num: usize);
 
     /// Return the count of the number of allocated grant pointers if the
-    /// process is active. This does not count custom grants. This is used
-    /// to determine if a new grant has been allocated after a call to
+    /// process is active. This does not count custom grants. This is used to
+    /// determine if a new grant has been allocated after a call to
     /// `SyscallDriver::allocate_grant()`.
     ///
     /// Useful for debugging/inspecting the system.
@@ -633,12 +791,14 @@ pub trait Process {
 
     // subscribe
 
-    /// Verify that an Upcall function pointer is within process-accessible
+    /// Verify that an upcall function pointer is within process-accessible
     /// memory.
     ///
     /// Returns `true` if the upcall function pointer is valid for this process,
     /// and `false` otherwise.
-    fn is_valid_upcall_function_pointer(&self, upcall_fn: NonNull<()>) -> bool;
+    // `upcall_fn` can eventually be a better type:
+    // <https://github.com/tock/tock/issues/4134>
+    fn is_valid_upcall_function_pointer(&self, upcall_fn: *const ()) -> bool;
 
     // functions for processes that are architecture specific
 
@@ -673,23 +833,23 @@ pub trait Process {
     /// switched to.
     fn switch_to(&self) -> Option<syscall::ContextSwitchReason>;
 
-    /// Return process state information related to the location in memory
-    /// of various process data structures.
+    /// Return process state information related to the location in memory of
+    /// various process data structures.
     fn get_addresses(&self) -> ProcessAddresses;
 
     /// Return process state information related to the size in memory of
     /// various process data structures.
     fn get_sizes(&self) -> ProcessSizes;
 
-    /// Write stored state as a binary blob into the `out` slice. Returns the number of bytes
-    /// written to `out` on success.
+    /// Write stored state as a binary blob into the `out` slice. Returns the
+    /// number of bytes written to `out` on success.
     ///
-    /// Returns `ErrorCode::SIZE` if `out` is too short to hold the stored state binary
-    /// representation. Returns `ErrorCode::FAIL` on an internal error.
+    /// Returns `ErrorCode::SIZE` if `out` is too short to hold the stored state
+    /// binary representation. Returns `ErrorCode::FAIL` on an internal error.
     fn get_stored_state(&self, out: &mut [u8]) -> Result<usize, ErrorCode>;
 
-    /// Print out the full state of the process: its memory map, its
-    /// context, and the state of the memory protection unit (MPU).
+    /// Print out the full state of the process: its memory map, its context,
+    /// and the state of the memory protection unit (MPU).
     fn print_full_process(&self, writer: &mut dyn Write);
 
     // debug
@@ -733,6 +893,7 @@ pub struct ProcessCustomGrantIdentifier {
     pub(crate) offset: usize,
 }
 
+/// Error types related to processes.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     /// The process has been removed and no longer exists. For example, the
@@ -782,43 +943,20 @@ impl From<Error> for ErrorCode {
 
 /// States a process can be in.
 ///
-/// This is public so external implementations of `Process` can re-use
-/// these process states.
+/// This is public so external implementations of `Process` can re-use these
+/// process states.
 ///
-/// When the kernel first creates a process structure, it places it
-/// in the `CredentialsUnchecked` state. If the process is able to
-/// load successfully, the kernel uses the Credentials Checking Policy
-/// to decide whether to place the process in the `CredentialsApproved`
-/// or `CredentialsFailed` state.
-///
-/// A process in the `CredentialsUnchecked` or `CredentialsFailed` state
-/// is not runnable and the kernel should never run it.
-///
-/// Once a process is placed in the `CredentialsApproved` state, the
-/// kernel interprets this that the process is ready to run. The
-/// kernel checks the Application ID, Short ID, and version number of
-/// the Userspace Binary to decide if the process can run given other
-/// processes in the system.  If it can run, the kernel pushes its
-/// initial stack frame and transitions it to the `Yielded` state. If
-/// it cannot run because of the identifiers of other processes, the
-/// kernel transitions it to the `Terminated` state.
-///
-/// To start or restart a terminated process, the kernel transitions
-/// it into the `CredentialsApproved` state. This causes it to check
-/// whether it is runnable and then transition it as above.
-///
-/// While a process is running, it transitions between the `Running`,
-/// `Yielded`, `StoppedRunning`, and `StoppedYielded` states. If an
-/// error occurs (e.g., a memory access error), the kernel faults it
-/// and either leaves it in the `Faulted` state, restarts it, or takes
-/// some other action defined by the kernel fault policy. If the
-/// process issues an `exit-terminate` system call, it enters the
+/// While a process is running, it transitions between the `Running`, `Yielded`,
+/// `YieldedFor`, and `Stopped` states. If an error occurs (e.g., a memory
+/// access error), the kernel faults it and either leaves it in the `Faulted`
+/// state, restarts it, or takes some other action defined by the kernel fault
+/// policy. If the process issues an `exit-terminate` system call, it enters the
 /// `Terminated` state. If it issues an `exit-restart` system call, it
-/// terminates then tries to transition to `CredentialsApproved`.
+/// terminates then tries to back to a runnable state.
 ///
-/// When a process faults, it enters the `Faulted` state. To be
-/// restarted, it must first transition to the `Terminated` state,
-/// which means that all of its state has been cleaned up.
+/// When a process faults, it enters the `Faulted` state. To be restarted, it
+/// must first transition to the `Terminated` state, which means that all of its
+/// state has been cleaned up.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum State {
     /// Process expects to be running code. The process may not be currently
@@ -832,45 +970,46 @@ pub enum State {
     /// scheduled again.
     Yielded,
 
-    /// The process is stopped, and its previous state was Running. This is used
-    /// if the kernel forcibly stops a process when it is in the `Running`
-    /// state. This state indicates to the kernel not to schedule the process,
-    /// but if the process is to be resumed later it should be put back in the
-    /// running state so it will execute correctly.
-    StoppedRunning,
+    /// Process stopped executing and returned to the kernel because it called
+    /// the `WaitFor` variant of the `yield` syscall. The process should not be
+    /// scheduled until the specified driver attempts to execute the specified
+    /// upcall.
+    YieldedFor(UpcallId),
 
-    /// The process is stopped, and it was stopped while it was yielded. If this
-    /// process needs to be resumed it should be put back in the `Yield` state.
-    StoppedYielded,
+    /// The process is stopped and the previous state the process was in when it
+    /// was stopped. This is used if the kernel forcibly stops a process. This
+    /// state indicates to the kernel not to schedule the process, but if the
+    /// process is to be resumed later it should be put back in its previous
+    /// state so it will execute correctly.
+    Stopped(StoppedState),
 
-    /// The process ran, faulted while running, and is no longer
-    /// runnable. For a faulted process to be made runnable, it must
-    /// first be terminated (to clean up its state).
+    /// The process ran, faulted while running, and is no longer runnable. For a
+    /// faulted process to be made runnable, it must first be terminated (to
+    /// clean up its state).
     Faulted,
 
-    /// The process's credentials have been approved but it is not
-    /// running: it exited with the `exit-terminate` system call or
-    /// was terminated for some other reason (e.g., by the process
-    /// console).  Processes in the `Terminated` state can be
-    /// transitioned into `CredentialsApproved` to run again.
+    /// The process is not running: it exited with the `exit-terminate` system
+    /// call or was terminated for some other reason (e.g., by the process
+    /// console). Processes in the `Terminated` state can be run again.
     Terminated,
+}
 
-    /// The process's credentials have not been checked to be allowed
-    /// to run yet: it needs to be checked by an
-    /// `AppCredentialsChecker` to be transitioned into the
-    /// `CredentialsApproved` or `CredentialsFailed` state. Processes
-    /// in this state cannot be run.
-    CredentialsUnchecked,
-
-    /// The Userspace Binary's credentials have been approved by the Process Checking
-    /// Policy but the process is not running (does not have an active stack).
-    /// The kernel tries to run processes in this state, first checking their
-    /// Application Identifiers and Short IDs for uniqueness.
-    CredentialsApproved,
-
-    /// The Process failed verification: it was terminated before it was
-    /// verified. Processes in this state cannot be run.
-    CredentialsFailed,
+/// States a process could previously have been in when stopped.
+///
+/// This is public so external implementations of `Process` can re-use these
+/// process stopped states.
+///
+/// These are recorded so the process can be returned to its previous state when
+/// it is resumed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StoppedState {
+    /// The process was in the running state when it was stopped.
+    Running,
+    /// The process was in the yielded state when it was stopped.
+    Yielded,
+    /// The process was in the yielded for state when it was stopped with a
+    /// particular upcall it was waiting for.
+    YieldedFor(UpcallId),
 }
 
 /// The action the kernel should take when a process encounters a fault.
@@ -906,6 +1045,10 @@ pub enum Task {
     /// Function pointer in the process to execute. Generally this is a upcall
     /// from a capsule.
     FunctionCall(FunctionCall),
+    /// Data to return to the process. This is used to resume a suspended
+    /// process without invoking any callbacks in userspace (e.g., in response
+    /// to a YieldFor).
+    ReturnValue(ReturnArguments),
     /// An IPC operation that needs additional setup to configure memory access.
     IPC((ProcessId, ipc::IPCUpcallType)),
 }
@@ -934,16 +1077,41 @@ pub enum FunctionCallSource {
 /// that it can be unscheduled when the process unsubscribes from this upcall.
 #[derive(Copy, Clone, Debug)]
 pub struct FunctionCall {
+    /// Whether the kernel called this directly or this is an upcall.
     pub source: FunctionCallSource,
+    /// The first argument to the function.
     pub argument0: usize,
+    /// The second argument to the function.
     pub argument1: usize,
+    /// The third argument to the function.
     pub argument2: usize,
-    pub argument3: usize,
-    pub pc: usize,
+    /// The userdata provided by the process via `subscribe`
+    pub argument3: CapabilityPtr,
+    /// The PC of the function to execute.
+    pub pc: CapabilityPtr,
 }
 
-/// Collection of process state information related to the memory addresses
-/// of different elements of the process.
+/// This is similar to `FunctionCall` but for the special case of the Null
+/// Upcall for a subscribe.
+///
+/// Because there is no function pointer in a Null Upcall we can only
+/// return these values to userspace. This is used to pass around
+/// upcall parameters when there is no associated upcall to actually
+/// call or userdata.
+#[derive(Copy, Clone, Debug)]
+pub struct ReturnArguments {
+    /// Which upcall generates this event.
+    pub upcall_id: UpcallId,
+    /// The first argument to return.
+    pub argument0: usize,
+    /// The second argument to return.
+    pub argument1: usize,
+    /// The third argument to return.
+    pub argument2: usize,
+}
+
+/// Collection of process state information related to the memory addresses of
+/// different elements of the process.
 pub struct ProcessAddresses {
     /// The address of the beginning of the process's region in nonvolatile
     /// memory.
@@ -952,10 +1120,10 @@ pub struct ProcessAddresses {
     /// nonvolatile memory. This is after the TBF header and any other memory
     /// the kernel has reserved for its own use.
     pub flash_non_protected_start: usize,
-    /// The address immediately after the end of part of the process
-    /// binary that is covered by integrity; the integrity region is
-    /// [flash_start - flash_integrity_end). Footers are stored in
-    /// the flash after flash_integrity_end.
+    /// The address immediately after the end of part of the process binary that
+    /// is covered by integrity; the integrity region is [flash_start -
+    /// flash_integrity_end). Footers are stored in the flash after
+    /// flash_integrity_end.
     pub flash_integrity_end: *const u8,
     /// The address immediately after the end of the region allocated for this
     /// process in nonvolatile memory.

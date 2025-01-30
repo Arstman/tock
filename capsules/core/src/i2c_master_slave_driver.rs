@@ -106,7 +106,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwMasterClient
     fn command_complete(&self, buffer: &'static mut [u8], status: Result<(), hil::i2c::Error>) {
         // Map I2C error to a number we can pass back to the application
         let status = kernel::errorcode::into_statuscode(match status {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(e) => Err(e.into()),
         });
 
@@ -117,7 +117,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwMasterClient
                 self.master_buffer.replace(buffer);
 
                 self.app.map(|app| {
-                    let _ = self.apps.enter(*app, |_, kernel_data| {
+                    let _ = self.apps.enter(app, |_, kernel_data| {
                         kernel_data.schedule_upcall(0, (0, status, 0)).ok();
                     });
                 });
@@ -125,7 +125,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwMasterClient
 
             MasterAction::Read(read_len) => {
                 self.app.map(|app| {
-                    let _ = self.apps.enter(*app, |_, kernel_data| {
+                    let _ = self.apps.enter(app, |_, kernel_data| {
                         // Because this (somewhat incorrectly) doesn't report
                         // back how many bytes were read, the result of mut_enter
                         // is ignored. Note that this requires userspace to keep
@@ -155,7 +155,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwMasterClient
 
             MasterAction::WriteRead(read_len) => {
                 self.app.map(|app| {
-                    let _ = self.apps.enter(*app, |_, kernel_data| {
+                    let _ = self.apps.enter(app, |_, kernel_data| {
                         // Because this (somewhat incorrectly) doesn't report
                         // back how many bytes were read, the result of mut_enter
                         // is ignored. Note that this requires userspace to keep
@@ -206,7 +206,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwSlaveClient
         match transmission_type {
             hil::i2c::SlaveTransmissionType::Write => {
                 self.app.map(|app| {
-                    let _ = self.apps.enter(*app, |_, kernel_data| {
+                    let _ = self.apps.enter(app, |_, kernel_data| {
                         kernel_data
                             .get_readwrite_processbuffer(rw_allow::SLAVE_RX)
                             .and_then(|slave_rx| {
@@ -220,7 +220,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwSlaveClient
                                     // userspace. The I2C syscall API should pass back lengths.
                                     // -pal 3/5/21
                                     let buf_len = cmp::min(app_rx.len(), buffer.len());
-                                    let read_len = cmp::min(buf_len, length as usize);
+                                    let read_len = cmp::min(buf_len, length);
 
                                     for (i, c) in buffer[0..read_len].iter_mut().enumerate() {
                                         app_rx[i].set(*c);
@@ -232,7 +232,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwSlaveClient
                             })
                             .unwrap_or(0);
 
-                        kernel_data.schedule_upcall(0, (3, length as usize, 0)).ok();
+                        kernel_data.schedule_upcall(0, (3, length, 0)).ok();
                     });
                 });
             }
@@ -242,8 +242,8 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwSlaveClient
 
                 // Notify the app that the read finished
                 self.app.map(|app| {
-                    let _ = self.apps.enter(*app, |_, kernel_data| {
-                        kernel_data.schedule_upcall(0, (4, length as usize, 0)).ok();
+                    let _ = self.apps.enter(app, |_, kernel_data| {
+                        kernel_data.schedule_upcall(0, (4, length, 0)).ok();
                     });
                 });
             }
@@ -254,7 +254,7 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> hil::i2c::I2CHwSlaveClient
         // Pass this up to the client. Not much we can do until the application
         // has setup a buffer to read from.
         self.app.map(|app| {
-            let _ = self.apps.enter(*app, |_, kernel_data| {
+            let _ = self.apps.enter(app, |_, kernel_data| {
                 // Ask the app to setup a read buffer. The app must call
                 // command 3 after it has setup the shared read buffer with
                 // the correct bytes.
@@ -284,15 +284,14 @@ impl<'a, I: hil::i2c::I2CMasterSlave<'a>> SyscallDriver for I2CMasterSlaveDriver
         process_id: ProcessId,
     ) -> CommandReturn {
         if command_num == 0 {
-            // Handle this first as it should be returned
-            // unconditionally
+            // Handle unconditional driver existence check.
             return CommandReturn::success();
         }
         // Check if this non-virtualized driver is already in use by
         // some (alive) process
         let match_or_empty_or_nonexistant = self.app.map_or(true, |current_process| {
             self.apps
-                .enter(*current_process, |_, _| current_process == &process_id)
+                .enter(current_process, |_, _| current_process == process_id)
                 .unwrap_or(true)
         });
         if match_or_empty_or_nonexistant {

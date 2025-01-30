@@ -3,9 +3,10 @@
 // Copyright Tock Contributors 2022.
 
 //! Implements Type-Length-Value (TLV) encoding and decoding as outlined
-//! in the Thread 1.1.1 Specification. TLVs are used to serialize
-//! information exchanged during mesh link establishment (MLE). MLE is
-//! covered in Chapter 4.
+//! in the Thread 1.1.1 Specification.
+//!
+//! TLVs are used to serialize information exchanged during mesh link
+//! establishment (MLE). MLE is covered in Chapter 4.
 //!
 //! MLE messages consist of a command type and a series of TLV parameters.
 //!
@@ -123,6 +124,13 @@ pub enum Tlv<'a> {
     PendingOperationalDataset(&'a [u8]),
 }
 
+pub fn unwrap_tlv_offset(res: SResult) -> usize {
+    match res {
+        SResult::Done(val, ()) => val,
+        _ => 0,
+    }
+}
+
 impl Tlv<'_> {
     /// Serializes TLV data in `buf` into the format specific to the TLV
     /// type.
@@ -196,13 +204,13 @@ impl Tlv<'_> {
                 offset = enc_consume!(buf, offset; encode_u8, leader_router_id);
                 stream_done!(offset)
             }
-            Tlv::NetworkData(ref network_data_tlvs) => {
+            Tlv::NetworkData(network_data_tlvs) => {
                 let value_width = network_data_tlvs.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes, network_data_tlvs);
                 stream_done!(offset)
             }
-            Tlv::TlvRequest(ref tlv_codes) => {
+            Tlv::TlvRequest(tlv_codes) => {
                 let value_width = tlv_codes.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes, tlv_codes);
@@ -275,13 +283,13 @@ impl Tlv<'_> {
                 offset = enc_consume!(buf, offset; encode_u16, *version);
                 stream_done!(offset)
             }
-            Tlv::ActiveOperationalDataset(ref network_mgmt_tlvs) => {
+            Tlv::ActiveOperationalDataset(network_mgmt_tlvs) => {
                 let value_width = network_mgmt_tlvs.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes, network_mgmt_tlvs);
                 stream_done!(offset)
             }
-            Tlv::PendingOperationalDataset(ref network_mgmt_tlvs) => {
+            Tlv::PendingOperationalDataset(network_mgmt_tlvs) => {
                 let value_width = network_mgmt_tlvs.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes, network_mgmt_tlvs);
@@ -349,11 +357,11 @@ impl Tlv<'_> {
                 stream_done!(
                     offset,
                     Tlv::LeaderData {
-                        partition_id: partition_id,
-                        weighting: weighting,
-                        data_version: data_version,
-                        stable_data_version: stable_data_version,
-                        leader_router_id: leader_router_id,
+                        partition_id,
+                        weighting,
+                        data_version,
+                        stable_data_version,
+                        leader_router_id,
                     }
                 )
             }
@@ -393,15 +401,15 @@ impl Tlv<'_> {
                 stream_done!(
                     offset,
                     Tlv::Connectivity {
-                        parent_priority: parent_priority,
-                        link_quality_3: link_quality_3,
-                        link_quality_2: link_quality_2,
-                        link_quality_1: link_quality_1,
-                        leader_cost: leader_cost,
-                        id_sequence: id_sequence,
-                        active_routers: active_routers,
-                        sed_buffer_size: sed_buffer_size,
-                        sed_datagram_count: sed_datagram_count,
+                        parent_priority,
+                        link_quality_3,
+                        link_quality_2,
+                        link_quality_1,
+                        leader_cost,
+                        id_sequence,
+                        active_routers,
+                        sed_buffer_size,
+                        sed_datagram_count,
                     }
                 )
             }
@@ -633,7 +641,7 @@ impl NetworkDataTlv<'_> {
 
     fn encode_tl(&self, buf: &mut [u8], value_width: usize, stable: bool) -> SResult {
         stream_len_cond!(buf, TL_WIDTH + value_width);
-        let stable_bit = if stable { 1u8 } else { 0u8 };
+        let stable_bit = u8::from(stable);
         buf[0] = (NetworkDataTlvType::from(self) as u8) << 1 | stable_bit;
         buf[1] = value_width as u8;
         stream_done!(TL_WIDTH)
@@ -661,9 +669,9 @@ impl NetworkDataTlv<'_> {
                     offset + length as usize,
                     (
                         NetworkDataTlv::Prefix {
-                            domain_id: domain_id,
-                            prefix_length_bits: prefix_length_bits,
-                            prefix: prefix,
+                            domain_id,
+                            prefix_length_bits,
+                            prefix,
                             sub_tlvs: &buf[offset..offset + length as usize],
                         },
                         stable
@@ -678,8 +686,8 @@ impl NetworkDataTlv<'_> {
                     offset,
                     (
                         NetworkDataTlv::CommissioningData {
-                            com_length: com_length,
-                            com_data: com_data,
+                            com_length,
+                            com_data,
                         },
                         stable
                     )
@@ -697,11 +705,11 @@ impl NetworkDataTlv<'_> {
                     offset + length as usize,
                     (
                         NetworkDataTlv::Service {
-                            thread_enterprise_number: thread_enterprise_number,
-                            s_id: s_id,
-                            s_enterprise_number: s_enterprise_number,
-                            s_service_data_length: s_service_data_length,
-                            s_service_data: s_service_data,
+                            thread_enterprise_number,
+                            s_id,
+                            s_enterprise_number,
+                            s_service_data_length,
+                            s_service_data,
                             sub_tlvs: &buf[offset..offset + length as usize],
                         },
                         stable
@@ -760,13 +768,13 @@ impl PrefixSubTlv<'_> {
     /// Prefix sub-TLV type.
     pub fn encode(&self, buf: &mut [u8], stable: bool) -> SResult {
         match *self {
-            PrefixSubTlv::HasRoute(ref r_border_router_16s) => {
+            PrefixSubTlv::HasRoute(r_border_router_16s) => {
                 let value_width = r_border_router_16s.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width, stable);
                 offset = enc_consume!(buf, offset; encode_bytes, r_border_router_16s);
                 stream_done!(offset)
             }
-            PrefixSubTlv::BorderRouter(ref p_border_router_16s) => {
+            PrefixSubTlv::BorderRouter(p_border_router_16s) => {
                 let value_width = p_border_router_16s.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width, stable);
                 offset = enc_consume!(buf, offset; encode_bytes, p_border_router_16s);
@@ -779,7 +787,7 @@ impl PrefixSubTlv<'_> {
             } => {
                 let value_width = mem::size_of::<u8>() + mem::size_of::<u8>();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width, stable);
-                let compress_bit = if context_id_compress { 1u8 } else { 0u8 };
+                let compress_bit = u8::from(context_id_compress);
                 let first_byte = (compress_bit << 4) | (context_id & 0b1111);
                 offset = enc_consume!(buf, offset; encode_u8, first_byte);
                 offset = enc_consume!(buf, offset; encode_u8, context_length);
@@ -790,7 +798,7 @@ impl PrefixSubTlv<'_> {
 
     fn encode_tl(&self, buf: &mut [u8], value_width: usize, stable: bool) -> SResult {
         stream_len_cond!(buf, TL_WIDTH + value_width);
-        let stable_bit = if stable { 1u8 } else { 0u8 };
+        let stable_bit = u8::from(stable);
         buf[0] = (PrefixSubTlvType::from(self) as u8) << 1 | stable_bit;
         buf[1] = value_width as u8;
         stream_done!(TL_WIDTH)
@@ -832,9 +840,9 @@ impl PrefixSubTlv<'_> {
                     offset,
                     (
                         PrefixSubTlv::SixLoWpanId {
-                            context_id_compress: context_id_compress,
-                            context_id: context_id,
-                            context_length: context_length,
+                            context_id_compress,
+                            context_id,
+                            context_length,
                         },
                         stable
                     )
@@ -888,7 +896,7 @@ impl HasRouteTlvValue {
     pub fn encode(&self, buf: &mut [u8]) -> SResult {
         stream_len_cond!(buf, 3);
         let mut offset = enc_consume!(buf, 0; encode_u16, self.r_border_router_16.to_be());
-        let last_byte = ((self.r_preference & 0b11) as u8) << 6;
+        let last_byte = (self.r_preference & 0b11) << 6;
         offset = enc_consume!(buf, offset; encode_u8, last_byte);
         stream_done!(offset)
     }
@@ -902,8 +910,8 @@ impl HasRouteTlvValue {
         stream_done!(
             offset,
             HasRouteTlvValue {
-                r_border_router_16: r_border_router_16,
-                r_preference: r_preference,
+                r_border_router_16,
+                r_preference,
             }
         )
     }
@@ -946,8 +954,8 @@ impl BorderRouterTlvValue {
         stream_done!(
             offset,
             BorderRouterTlvValue {
-                p_border_router_16: p_border_router_16,
-                p_bits: p_bits,
+                p_border_router_16,
+                p_bits,
             }
         )
     }
@@ -982,7 +990,7 @@ impl ServiceSubTlv {
 
     fn encode_tl(&self, buf: &mut [u8], value_width: usize, stable: bool) -> SResult {
         stream_len_cond!(buf, TL_WIDTH + value_width);
-        let stable_bit = if stable { 1u8 } else { 0u8 };
+        let stable_bit = u8::from(stable);
         buf[0] = (ServiceSubTlvType::from(self) as u8) << 1 | stable_bit;
         buf[1] = value_width as u8;
         stream_done!(TL_WIDTH)
@@ -1009,8 +1017,8 @@ impl ServiceSubTlv {
                     offset,
                     (
                         ServiceSubTlv::Server {
-                            s_server_16: s_server_16,
-                            s_server_data: s_server_data,
+                            s_server_16,
+                            s_server_data,
                         },
                         stable
                     )
@@ -1189,12 +1197,12 @@ impl NetworkManagementTlv<'_> {
                 let value_width = timestamp_seconds.len() + mem::size_of::<u16>();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes_be, &timestamp_seconds);
-                let u_bit_val = if u_bit { 1u16 } else { 0u16 };
+                let u_bit_val = u16::from(u_bit);
                 let end_bytes = (timestamp_ticks << 1) | u_bit_val;
                 offset = enc_consume!(buf, offset; encode_u16, end_bytes.to_be());
                 stream_done!(offset)
             }
-            NetworkManagementTlv::CommissionerUdpPort(ref udp_port) => {
+            NetworkManagementTlv::CommissionerUdpPort(udp_port) => {
                 let value_width = mem::size_of::<u16>();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_u16, udp_port.to_be());
@@ -1208,18 +1216,18 @@ impl NetworkManagementTlv<'_> {
                 let value_width = timestamp_seconds.len() + mem::size_of::<u16>();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes_be, &timestamp_seconds);
-                let u_bit_val = if u_bit { 1u16 } else { 0u16 };
+                let u_bit_val = u16::from(u_bit);
                 let end_bytes = (timestamp_ticks << 1) | u_bit_val;
                 offset = enc_consume!(buf, offset; encode_u16, end_bytes.to_be());
                 stream_done!(offset)
             }
-            NetworkManagementTlv::DelayTimer(ref time_remaining) => {
+            NetworkManagementTlv::DelayTimer(time_remaining) => {
                 let value_width = mem::size_of::<u32>();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_u32, time_remaining.to_be());
                 stream_done!(offset)
             }
-            NetworkManagementTlv::ChannelMask(ref entries) => {
+            NetworkManagementTlv::ChannelMask(entries) => {
                 let value_width = entries.len();
                 let mut offset = enc_consume!(buf; self; encode_tl, value_width);
                 offset = enc_consume!(buf, offset; encode_bytes, entries);
@@ -1252,8 +1260,8 @@ impl NetworkManagementTlv<'_> {
                 stream_done!(
                     offset,
                     NetworkManagementTlv::Channel {
-                        channel_page: channel_page,
-                        channel: channel,
+                        channel_page,
+                        channel,
                     }
                 )
             }
@@ -1324,8 +1332,8 @@ impl NetworkManagementTlv<'_> {
                 stream_done!(
                     offset,
                     NetworkManagementTlv::SecurityPolicy {
-                        rotation_time: rotation_time,
-                        policy_bits: policy_bits,
+                        rotation_time,
+                        policy_bits,
                     }
                 )
             }
@@ -1336,7 +1344,7 @@ impl NetworkManagementTlv<'_> {
                 stream_done!(
                     offset,
                     NetworkManagementTlv::ActiveTimestamp {
-                        timestamp_seconds: timestamp_seconds,
+                        timestamp_seconds,
                         timestamp_ticks: timestamp_ticks >> 1,
                         u_bit: (timestamp_ticks & 1u16) > 0,
                     }
@@ -1353,7 +1361,7 @@ impl NetworkManagementTlv<'_> {
                 stream_done!(
                     offset,
                     NetworkManagementTlv::PendingTimestamp {
-                        timestamp_seconds: timestamp_seconds,
+                        timestamp_seconds,
                         timestamp_ticks: timestamp_ticks >> 1,
                         u_bit: (timestamp_ticks & 1u16) > 0,
                     }
@@ -1497,9 +1505,9 @@ impl ChannelMaskEntry {
         stream_done!(
             offset,
             ChannelMaskEntry {
-                channel_page: channel_page,
-                mask_length: mask_length,
-                channel_mask: channel_mask,
+                channel_page,
+                mask_length,
+                channel_mask,
             }
         )
     }

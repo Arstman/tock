@@ -27,7 +27,7 @@ impl Writer {
         self.uart.set(uart);
     }
 
-    fn write_to_uart<'a>(&self, uart: &'a Uart, buf: &[u8]) {
+    fn write_to_uart(&self, uart: &Uart, buf: &[u8]) {
         for &c in buf {
             uart.send_byte(c);
         }
@@ -86,19 +86,21 @@ impl IoWrite for Writer {
 #[cfg(not(test))]
 #[no_mangle]
 #[panic_handler]
-pub unsafe extern "C" fn panic_fmt(pi: &PanicInfo) -> ! {
-    // LED is conneted to GPIO 25
+pub unsafe fn panic_fmt(pi: &PanicInfo) -> ! {
+    // LED is connected to GPIO 25
+
+    use core::ptr::{addr_of, addr_of_mut};
     let led_kernel_pin = &RPGpioPin::new(RPGpio::GPIO25);
     let led = &mut LedHigh::new(led_kernel_pin);
-    let writer = &mut WRITER;
+    let writer = &mut *addr_of_mut!(WRITER);
 
     debug::panic(
         &mut [led],
         writer,
         pi,
         &cortexm0p::support::nop,
-        &PROCESSES,
-        &CHIP,
-        &PROCESS_PRINTER,
+        &*addr_of!(PROCESSES),
+        &*addr_of!(CHIP),
+        &*addr_of!(PROCESS_PRINTER),
     )
 }

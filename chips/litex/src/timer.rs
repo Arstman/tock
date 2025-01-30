@@ -65,7 +65,7 @@ pub struct LiteXTimerRegisters<R: LiteXSoCRegisterConfiguration> {
     ///
     /// This register is only present if the SoC was configured with
     /// `timer_update = True`. Therefore, it's only indirectly
-    /// accessed by the [`LiteXTimerUptime`](LiteXTimerUptime) struct,
+    /// accessed by the [`LiteXTimerUptime`] struct,
     /// which a board will need to construct separately.
     uptime_latch: R::ReadWrite8,
     /// Latched uptime since power-up (in `sys_clk` cycles)
@@ -74,13 +74,13 @@ pub struct LiteXTimerRegisters<R: LiteXSoCRegisterConfiguration> {
     ///
     /// This register is only present if the SoC was configured with
     /// `timer_update = True`. Therefore, it's only indirectly
-    /// accessed by the [`LiteXTimerUptime`](LiteXTimerUptime) struct,
+    /// accessed by the [`LiteXTimerUptime`] struct,
     /// which a board will need to construct separately.
     uptime: R::ReadOnly64,
 }
 
 impl<R: LiteXSoCRegisterConfiguration> LiteXTimerRegisters<R> {
-    fn ev<'a>(&'a self) -> LiteXTimerEV<'a, R> {
+    fn ev(&self) -> LiteXTimerEV<'_, R> {
         LiteXTimerEV::<R>::new(&self.ev_status, &self.ev_pending, &self.ev_enable)
     }
 }
@@ -184,7 +184,7 @@ impl<R: LiteXSoCRegisterConfiguration, F: Frequency> LiteXTimer<'_, R, F> {
     ///
     /// Clients should use the [`LiteXTimerUptime`] wrapper instead,
     /// which exposes this value as part of their
-    /// [`Time::now`](Time::now) implementation.
+    /// [`Time::now`] implementation.
     unsafe fn uptime(&self) -> Ticks64 {
         WriteRegWrapper::wrap(&self.registers.uptime_latch).write(uptime_latch::latch_value::SET);
         self.registers.uptime.get().into()
@@ -348,7 +348,7 @@ impl<'a, R: LiteXSoCRegisterConfiguration, F: Frequency> Timer<'a> for LiteXTime
 /// LiteX does not have an [`Alarm`] compatible hardware peripheral,
 /// so an [`Alarm`] is emulated using a repeatedly set [`LiteXTimer`],
 /// comparing the current time against the [`LiteXTimerUptime`] (which
-/// is also exposed as [`Time::now`](Time::now).
+/// is also exposed as [`Time::now`].
 pub struct LiteXAlarm<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> {
     uptime: &'t LiteXTimerUptime<'t, R, F>,
     timer: &'t LiteXTimer<'t, R, F>,
@@ -366,7 +366,7 @@ impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> LiteXAlarm<'t, 'c, 
             uptime,
             timer,
             alarm_client: OptionalCell::empty(),
-            reference_time: Cell::new((0 as u32).into()),
+            reference_time: Cell::new((0_u32).into()),
             alarm_time: OptionalCell::empty(),
         }
     }
@@ -408,7 +408,7 @@ impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> LiteXAlarm<'t, 'c, 
             } else {
                 // Trigger an interrupt one tick from now, which will
                 // call this function again
-                self.timer.oneshot((1 as u32).into());
+                self.timer.oneshot((1_u32).into());
             }
         } else {
             // It's not yet time to call the client, set the timer
@@ -429,7 +429,7 @@ impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> LiteXAlarm<'t, 'c, 
     }
 }
 
-impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> Time for LiteXAlarm<'t, 'c, R, F> {
+impl<'t, R: LiteXSoCRegisterConfiguration, F: Frequency> Time for LiteXAlarm<'t, '_, R, F> {
     type Frequency = F;
     type Ticks = <LiteXTimerUptime<'t, R, F> as Time>::Ticks;
 
@@ -438,9 +438,7 @@ impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> Time for LiteXAlarm
     }
 }
 
-impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> Alarm<'c>
-    for LiteXAlarm<'t, 'c, R, F>
-{
+impl<'c, R: LiteXSoCRegisterConfiguration, F: Frequency> Alarm<'c> for LiteXAlarm<'_, 'c, R, F> {
     fn set_alarm_client(&self, client: &'c dyn AlarmClient) {
         self.alarm_client.set(client);
     }
@@ -464,7 +462,7 @@ impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> Alarm<'c>
 
     fn get_alarm(&self) -> Self::Ticks {
         // Undefined at boot, so 0
-        self.alarm_time.unwrap_or((0 as u32).into())
+        self.alarm_time.unwrap_or((0_u32).into())
     }
 
     fn is_armed(&self) -> bool {
@@ -479,13 +477,11 @@ impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> Alarm<'c>
     }
 
     fn minimum_dt(&self) -> Self::Ticks {
-        (1 as u32).into()
+        (1_u32).into()
     }
 }
 
-impl<'t, 'c, R: LiteXSoCRegisterConfiguration, F: Frequency> TimerClient
-    for LiteXAlarm<'t, 'c, R, F>
-{
+impl<R: LiteXSoCRegisterConfiguration, F: Frequency> TimerClient for LiteXAlarm<'_, '_, R, F> {
     fn timer(&self) {
         self.timer_tick(true);
     }

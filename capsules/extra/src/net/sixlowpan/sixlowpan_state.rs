@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
+//! 6loWPAN compression and reception.
+//!
 //! 6loWPAN (IPv6 over Low-Power Wireless Networks) is standard for compressing
 //! and fragmenting IPv6 packets over low power wireless networks, particularly
 //! ones with MTUs (Minimum Transmission Units) smaller than 1280 octets, like
@@ -250,11 +252,13 @@ use kernel::ErrorCode;
 // Reassembly timeout in seconds
 const FRAG_TIMEOUT: u32 = 60;
 
+/// Client trait for receiving 6lowpan frames.
+///
 /// Objects that implement this trait can set themselves to be the client
 /// for the [Sixlowpan](struct.Sixlowpan.html) struct, and will then receive
 /// a callback once an IPv6 packet has been fully reassembled.
 pub trait SixlowpanRxClient {
-    fn receive<'a>(&self, buf: &'a [u8], len: usize, result: Result<(), ErrorCode>);
+    fn receive(&self, buf: &[u8], len: usize, result: Result<(), ErrorCode>);
 }
 
 pub mod lowpan_frag {
@@ -355,7 +359,7 @@ impl<'a> TxState<'a> {
             dgram_offset: Cell::new(0),
 
             busy: Cell::new(false),
-            sixlowpan: sixlowpan,
+            sixlowpan,
         }
     }
 
@@ -478,7 +482,7 @@ impl<'a> TxState<'a> {
     ) -> Result<Frame, (Result<(), ErrorCode>, &'static mut [u8])> {
         // Here, we assume that the compressed headers fit in the first MTU
         // fragment. This is consistent with RFC 6282.
-        let mut lowpan_packet = [0 as u8; radio::MAX_FRAME_SIZE as usize];
+        let mut lowpan_packet = [0_u8; radio::MAX_FRAME_SIZE];
         let (consumed, written) = {
             match sixlowpan_compression::compress(
                 ctx_store,
@@ -487,7 +491,7 @@ impl<'a> TxState<'a> {
                 self.dst_mac_addr.get(),
                 &mut lowpan_packet,
             ) {
-                Err(_) => return Err((Err(ErrorCode::FAIL), frame.into_buf())),
+                Err(()) => return Err((Err(ErrorCode::FAIL), frame.into_buf())),
                 Ok(result) => result,
             }
         };
@@ -580,7 +584,7 @@ impl<'a> TxState<'a> {
             // statically allocate room on the stack. However, we do not know
             // how many additional headers we have until runtime. This
             // functionality should be fixed in the future.
-            let mut headers = [0 as u8; 60];
+            let mut headers = [0_u8; 60];
             ip6_packet.encode(&mut headers);
             let _ = frame.append_payload(&headers[dgram_offset..dgram_offset + headers_to_write]);
             payload_len -= headers_to_write;
@@ -591,7 +595,7 @@ impl<'a> TxState<'a> {
 
     fn write_frag_hdr(&self, frame: &mut Frame, first_frag: bool) -> usize {
         if first_frag {
-            let mut frag_header = [0 as u8; lowpan_frag::FRAG1_HDR_SIZE];
+            let mut frag_header = [0_u8; lowpan_frag::FRAG1_HDR_SIZE];
             set_frag_hdr(
                 self.dgram_size.get(),
                 self.dgram_tag.get(),
@@ -604,7 +608,7 @@ impl<'a> TxState<'a> {
             let _ = frame.append_payload(&frag_header);
             lowpan_frag::FRAG1_HDR_SIZE
         } else {
-            let mut frag_header = [0 as u8; lowpan_frag::FRAGN_HDR_SIZE];
+            let mut frag_header = [0_u8; lowpan_frag::FRAGN_HDR_SIZE];
             set_frag_hdr(
                 self.dgram_size.get(),
                 self.dgram_tag.get(),
@@ -646,7 +650,7 @@ pub struct RxState<'a> {
 }
 
 impl<'a> ListNode<'a, RxState<'a>> for RxState<'a> {
-    fn next(&'a self) -> &'a ListLink<RxState<'a>> {
+    fn next(&'a self) -> &'a ListLink<'a, RxState<'a>> {
         &self.next
     }
 }
@@ -724,18 +728,18 @@ impl<'a> RxState<'a> {
         dgram_offset: usize,
         ctx_store: &dyn ContextStore,
     ) -> Result<bool, Result<(), ErrorCode>> {
-        let mut packet = self.packet.take().ok_or(Err(ErrorCode::NOMEM))?;
+        let packet = self.packet.take().ok_or(Err(ErrorCode::NOMEM))?;
         let uncompressed_len = if dgram_offset == 0 {
             let (consumed, written) = sixlowpan_compression::decompress(
                 ctx_store,
-                &payload[0..payload_len as usize],
+                &payload[0..payload_len],
                 self.src_mac_addr.get(),
                 self.dst_mac_addr.get(),
-                &mut packet,
+                packet,
                 dgram_size,
                 true,
             )
-            .map_err(|_| Err(ErrorCode::FAIL))?;
+            .map_err(|()| Err(ErrorCode::FAIL))?;
             let remaining = payload_len - consumed;
             packet[written..written + remaining]
                 .copy_from_slice(&payload[consumed..consumed + remaining]);
@@ -774,7 +778,7 @@ impl<'a> RxState<'a> {
             // and thus the packet should always be here.
             self.packet
                 .map(|packet| {
-                    client.receive(&packet, self.dgram_size.get() as usize, result);
+                    client.receive(packet, self.dgram_size.get() as usize, result);
                 })
                 .unwrap(); // Unwrap fail = Error: `packet` is None in call to end_receive.
         });
@@ -805,7 +809,14 @@ pub struct Sixlowpan<'a, A: time::Alarm<'a>, C: ContextStore> {
 
 // This function is called after receiving a frame
 impl<'a, A: time::Alarm<'a>, C: ContextStore> RxClient for Sixlowpan<'a, A, C> {
-    fn receive<'b>(&self, buf: &'b [u8], header: Header<'b>, data_offset: usize, data_len: usize) {
+    fn receive<'b>(
+        &self,
+        buf: &'b [u8],
+        header: Header<'b>,
+        _lqi: u8,
+        data_offset: usize,
+        data_len: usize,
+    ) {
         // We return if retcode is not valid, as it does not make sense to issue
         // a callback for an invalid frame reception
         // TODO: Handle the case where the addresses are None/elided - they
@@ -872,8 +883,8 @@ impl<'a, A: time::Alarm<'a>, C: ContextStore> Sixlowpan<'a, A, C> {
     /// have an accuracy of at least 60 seconds.
     pub fn new(ctx_store: C, clock: &'a A) -> Sixlowpan<'a, A, C> {
         Sixlowpan {
-            ctx_store: ctx_store,
-            clock: clock,
+            ctx_store,
+            clock,
             tx_dgram_tag: Cell::new(0),
             rx_client: Cell::new(None),
 
@@ -905,7 +916,7 @@ impl<'a, A: time::Alarm<'a>, C: ContextStore> Sixlowpan<'a, A, C> {
                 dgram_offset,
             )
         } else {
-            self.receive_single_packet(&packet, packet_len, src_mac_addr, dst_mac_addr)
+            self.receive_single_packet(packet, packet_len, src_mac_addr, dst_mac_addr)
         }
     }
 
@@ -931,32 +942,35 @@ impl<'a, A: time::Alarm<'a>, C: ContextStore> Sixlowpan<'a, A, C> {
             // The packet buffer should *always* be there; in particular,
             // since this state is not busy, it must have the packet buffer.
             // Otherwise, we are in an inconsistent state and can fail.
-            let mut packet = state.packet.take().unwrap();
-            if is_lowpan(payload) {
-                let decompressed = sixlowpan_compression::decompress(
-                    &self.ctx_store,
-                    &payload[0..payload_len as usize],
-                    src_mac_addr,
-                    dst_mac_addr,
-                    &mut packet,
-                    0,
-                    false,
-                );
-                match decompressed {
-                    Ok((consumed, written)) => {
-                        let remaining = payload_len - consumed;
-                        packet[written..written + remaining]
-                            .copy_from_slice(&payload[consumed..consumed + remaining]);
-                        // Want dgram_size to contain decompressed size of packet
-                        state.dgram_size.set((written + remaining) as u16);
-                    }
-                    Err(_) => {
-                        return (None, Err(ErrorCode::FAIL));
-                    }
-                }
-            } else {
-                packet[0..payload_len].copy_from_slice(&payload[0..payload_len]);
+            let packet = state.packet.take().unwrap();
+
+            // Filter non 6LoWPAN packets and return
+            if !is_lowpan(payload) {
+                return (None, Ok(()));
             }
+
+            let decompressed = sixlowpan_compression::decompress(
+                &self.ctx_store,
+                &payload[0..payload_len],
+                src_mac_addr,
+                dst_mac_addr,
+                packet,
+                0,
+                false,
+            );
+            match decompressed {
+                Ok((consumed, written)) => {
+                    let remaining = payload_len - consumed;
+                    packet[written..written + remaining]
+                        .copy_from_slice(&payload[consumed..consumed + remaining]);
+                    // Want dgram_size to contain decompressed size of packet
+                    state.dgram_size.set((written + remaining) as u16);
+                }
+                Err(()) => {
+                    return (None, Err(ErrorCode::FAIL));
+                }
+            }
+
             state.packet.replace(packet);
             (Some(state), Ok(()))
         })

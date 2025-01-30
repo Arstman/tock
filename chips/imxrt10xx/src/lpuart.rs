@@ -369,7 +369,7 @@ impl<'a> Lpuart<'a> {
     ) -> Lpuart<'a> {
         Lpuart {
             registers: base_addr,
-            clock: clock,
+            clock,
 
             tx_client: OptionalCell::empty(),
             rx_client: OptionalCell::empty(),
@@ -395,7 +395,7 @@ impl<'a> Lpuart<'a> {
         dma_channel.set_client(self, self.tx_dma_source);
         unsafe {
             // Safety: pointing to static memory
-            dma_channel.set_destination(&self.registers.data as *const _ as *const u8);
+            dma_channel.set_destination(core::ptr::addr_of!(self.registers.data) as *const u8);
         }
         dma_channel.set_interrupt_on_completion(true);
         dma_channel.set_disable_on_completion(true);
@@ -407,7 +407,7 @@ impl<'a> Lpuart<'a> {
         dma_channel.set_client(self, self.rx_dma_source);
         unsafe {
             // Safety: pointing to static memory
-            dma_channel.set_source(&self.registers.data as *const _ as *const u8);
+            dma_channel.set_source(core::ptr::addr_of!(self.registers.data) as *const u8);
         }
         dma_channel.set_interrupt_on_completion(true);
         dma_channel.set_disable_on_completion(true);
@@ -428,7 +428,7 @@ impl<'a> Lpuart<'a> {
 
     pub fn set_baud(&self) {
         // Set the Baud Rate Modulo Divisor
-        self.registers.baud.modify(BAUD::SBR.val(139 as u32));
+        self.registers.baud.modify(BAUD::SBR.val(139_u32));
     }
 
     // for use by panic in io.rs
@@ -801,12 +801,12 @@ impl<'a> hil::uart::Transmit<'a> for Lpuart<'a> {
     }
 }
 
-impl<'a> hil::uart::Configure for Lpuart<'a> {
+impl hil::uart::Configure for Lpuart<'_> {
     fn configure(&self, params: hil::uart::Parameters) -> Result<(), ErrorCode> {
         if params.baud_rate != 115200
             || params.stop_bits != hil::uart::StopBits::One
             || params.parity != hil::uart::Parity::None
-            || params.hw_flow_control != false
+            || params.hw_flow_control
             || params.width != hil::uart::Width::Eight
         {
             panic!(
@@ -823,10 +823,10 @@ impl<'a> hil::uart::Configure for Lpuart<'a> {
         self.registers.baud.modify(BAUD::BOTHEDGE::SET);
 
         // Set Oversampling Ratio to 5 (the value written is -1)
-        self.registers.baud.modify(BAUD::OSR.val(0b100 as u32));
+        self.registers.baud.modify(BAUD::OSR.val(0b100_u32));
 
         // Set the Baud Rate Modulo Divisor
-        self.registers.baud.modify(BAUD::SBR.val(139 as u32));
+        self.registers.baud.modify(BAUD::SBR.val(139_u32));
 
         // Set bit count and parity mode
         self.registers.baud.modify(BAUD::M10::CLEAR);
@@ -916,7 +916,7 @@ impl ClockInterface for LpuartClock<'_> {
     }
 }
 
-impl<'a> dma::DmaClient for Lpuart<'a> {
+impl dma::DmaClient for Lpuart<'_> {
     fn transfer_complete(&self, result: dma::Result) {
         match result {
             // Successful transfer from memory to peripheral

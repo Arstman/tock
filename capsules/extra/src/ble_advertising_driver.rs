@@ -67,7 +67,7 @@
 //! You need a device that provides the `kernel::BleAdvertisementDriver` trait along with a virtual
 //! timer to perform events and not block the entire kernel
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //! # use capsules::virtual_alarm::VirtualMuxAlarm;
 //!
@@ -269,7 +269,7 @@ impl App {
                             let adv_data_len =
                                 cmp::min(kernel_tx.len() - PACKET_ADDR_LEN - 2, adv_data.len());
                             let adv_data_corrected =
-                                adv_data.get_to(..adv_data_len).ok_or(ErrorCode::SIZE)?;
+                                adv_data.get(..adv_data_len).ok_or(ErrorCode::SIZE)?;
                             let payload_len = adv_data_corrected.len() + PACKET_ADDR_LEN;
                             {
                                 let (header, payload) = kernel_tx.split_at_mut(2);
@@ -358,11 +358,11 @@ where
         alarm: &'a A,
     ) -> BLE<'a, B, A> {
         BLE {
-            radio: radio,
+            radio,
             busy: Cell::new(false),
             app: container,
             kernel_tx: kernel::utilities::cells::TakeCell::new(tx_buf),
-            alarm: alarm,
+            alarm,
             sending_app: OptionalCell::empty(),
             receiving_app: OptionalCell::empty(),
         }
@@ -377,9 +377,9 @@ where
     // likely be chosen.
     fn reset_active_alarm(&self) {
         let now = self.alarm.now();
-        let mut next_ref = u32::max_value();
-        let mut next_dt = u32::max_value();
-        let mut next_dist = u32::max_value();
+        let mut next_ref = u32::MAX;
+        let mut next_dt = u32::MAX;
+        let mut next_dist = u32::MAX;
         for app in self.app.iter() {
             app.enter(|app, _| match app.alarm_data.expiration {
                 Expiration::Enabled(reference, dt) => {
@@ -394,7 +394,7 @@ where
                 Expiration::Disabled => {}
             });
         }
-        if next_ref != u32::max_value() {
+        if next_ref != u32::MAX {
             self.alarm
                 .set_alarm(A::Ticks::from(next_ref), A::Ticks::from(next_dt));
         }
@@ -450,7 +450,7 @@ where
                             let _ = app.send_advertisement(
                                 processid,
                                 kernel_data,
-                                &self,
+                                self,
                                 RadioChannel::AdvertisingChannel37,
                             );
                         }
@@ -483,7 +483,7 @@ where
 {
     fn receive_event(&self, buf: &'static mut [u8], len: u8, result: Result<(), ErrorCode>) {
         self.receiving_app.map(|processid| {
-            let _ = self.app.enter(*processid, |app, kernel_data| {
+            let _ = self.app.enter(processid, |app, kernel_data| {
                 // Validate the received data, because ordinary BLE packets can be bigger than 39
                 // bytes. Thus, we need to check for that!
                 // Moreover, we use the packet header to find size but the radio reads maximum
@@ -521,7 +521,7 @@ where
                     Some(BLEState::Scanning(RadioChannel::AdvertisingChannel37)) => {
                         app.process_status =
                             Some(BLEState::Scanning(RadioChannel::AdvertisingChannel38));
-                        self.receiving_app.set(*processid);
+                        self.receiving_app.set(processid);
                         let _ = self.radio.set_tx_power(app.tx_power);
                         self.radio
                             .receive_advertisement(RadioChannel::AdvertisingChannel38);
@@ -529,7 +529,7 @@ where
                     Some(BLEState::Scanning(RadioChannel::AdvertisingChannel38)) => {
                         app.process_status =
                             Some(BLEState::Scanning(RadioChannel::AdvertisingChannel39));
-                        self.receiving_app.set(*processid);
+                        self.receiving_app.set(processid);
                         self.radio
                             .receive_advertisement(RadioChannel::AdvertisingChannel39);
                     }
@@ -558,17 +558,17 @@ where
     fn transmit_event(&self, buf: &'static mut [u8], _crc_ok: Result<(), ErrorCode>) {
         self.kernel_tx.replace(buf);
         self.sending_app.map(|processid| {
-            let _ = self.app.enter(*processid, |app, kernel_data| {
+            let _ = self.app.enter(processid, |app, kernel_data| {
                 match app.process_status {
                     Some(BLEState::Advertising(RadioChannel::AdvertisingChannel37)) => {
                         app.process_status =
                             Some(BLEState::Advertising(RadioChannel::AdvertisingChannel38));
-                        self.sending_app.set(*processid);
+                        self.sending_app.set(processid);
                         let _ = self.radio.set_tx_power(app.tx_power);
                         let _ = app.send_advertisement(
-                            *processid,
+                            processid,
                             kernel_data,
-                            &self,
+                            self,
                             RadioChannel::AdvertisingChannel38,
                         );
                     }
@@ -576,11 +576,11 @@ where
                     Some(BLEState::Advertising(RadioChannel::AdvertisingChannel38)) => {
                         app.process_status =
                             Some(BLEState::Advertising(RadioChannel::AdvertisingChannel39));
-                        self.sending_app.set(*processid);
+                        self.sending_app.set(processid);
                         let _ = app.send_advertisement(
-                            *processid,
+                            processid,
                             kernel_data,
-                            &self,
+                            self,
                             RadioChannel::AdvertisingChannel39,
                         );
                     }
@@ -637,12 +637,12 @@ where
                     .map_or_else(
                         |err| CommandReturn::failure(err.into()),
                         |res| match res {
-                            Ok(_) => {
+                            Ok(()) => {
                                 // must be called outside closure passed to grant region!
                                 self.reset_active_alarm();
                                 CommandReturn::success()
                             }
-                            Err(e) => CommandReturn::failure(e.into()),
+                            Err(e) => CommandReturn::failure(e),
                         },
                     )
             }
@@ -705,19 +705,18 @@ where
                     .map_or_else(
                         |err| err.into(),
                         |res| match res {
-                            Ok(_) => {
+                            Ok(()) => {
                                 // must be called outside closure passed to grant region!
                                 self.reset_active_alarm();
                                 CommandReturn::success()
                             }
-                            Err(e) => CommandReturn::failure(e.into()),
+                            Err(e) => CommandReturn::failure(e),
                         },
                     )
             }
 
             _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
         }
-        .into()
     }
 
     fn allocate_grant(&self, processid: ProcessId) -> Result<(), kernel::process::Error> {

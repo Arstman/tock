@@ -208,40 +208,6 @@ register_bitfields![u64,
     ]
 ];
 
-enum SetupRequest {
-    GetStatus = 0,
-    ClearFeature = 1,
-    SetFeature = 3,
-    SetAddress = 5,
-    GetDescriptor = 6,
-    SetDescriptor = 7,
-    GetConfiguration = 8,
-    SetConfiguration = 9,
-    GetInterface = 10,
-    SetInterface = 11,
-    SynchFrame = 12,
-    Unsupported = 100,
-}
-
-impl From<u32> for SetupRequest {
-    fn from(num: u32) -> Self {
-        match num {
-            0 => SetupRequest::GetStatus,
-            1 => SetupRequest::ClearFeature,
-            3 => SetupRequest::SetFeature,
-            5 => SetupRequest::SetAddress,
-            6 => SetupRequest::GetDescriptor,
-            7 => SetupRequest::SetDescriptor,
-            8 => SetupRequest::GetConfiguration,
-            9 => SetupRequest::SetConfiguration,
-            10 => SetupRequest::GetInterface,
-            11 => SetupRequest::SetInterface,
-            12 => SetupRequest::SynchFrame,
-            _ => SetupRequest::Unsupported,
-        }
-    }
-}
-
 /// State of the control endpoint (endpoint 0).
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum CtrlState {
@@ -706,7 +672,7 @@ impl<'a> Usb<'a> {
 
         self.client.map(|client| {
             self.copy_from_hw(ep, buf_id, size as usize);
-            let result = client.packet_out(self.get_transfer_type(ep), ep as usize, size);
+            let result = client.packet_out(self.get_transfer_type(ep), ep, size);
             match self.descriptors[ep].state.get() {
                 EndpointState::Disabled => unimplemented!(),
                 EndpointState::Ctrl(_state) => unimplemented!(),
@@ -776,27 +742,27 @@ impl<'a> Usb<'a> {
                     EndpointState::Interrupt(packet_size, state) => match state {
                         InterruptState::Init => {}
                         InterruptState::In(send_size) => {
-                            let buf = self.registers.configin[ep as usize].read(CONFIGIN::BUFFER);
+                            let buf = self.registers.configin[ep].read(CONFIGIN::BUFFER);
                             self.free_buffer(buf as usize);
 
                             self.client.map(|client| {
-                                match client.packet_in(TransferType::Interrupt, ep as usize) {
+                                match client.packet_in(TransferType::Interrupt, ep) {
                                     hil::usb::InResult::Packet(size) => {
                                         if size == 0 {
                                             panic!("Empty ctrl packet?");
                                         }
 
-                                        self.copy_slice_out_to_hw(ep as usize, buf as usize, size);
+                                        self.copy_slice_out_to_hw(ep, buf as usize, size);
 
                                         if send_size == size {
-                                            self.descriptors[ep as usize].state.set(
+                                            self.descriptors[ep].state.set(
                                                 EndpointState::Interrupt(
                                                     packet_size,
                                                     InterruptState::Init,
                                                 ),
                                             );
                                         } else {
-                                            self.descriptors[ep as usize].state.set(
+                                            self.descriptors[ep].state.set(
                                                 EndpointState::Interrupt(
                                                     packet_size,
                                                     InterruptState::In(send_size - size),
@@ -822,7 +788,7 @@ impl<'a> Usb<'a> {
 
                 // We are handling this case, clear it
                 self.registers.in_sent.set(1 << ep);
-                in_sent = in_sent & !(1 << ep);
+                in_sent &= !(1 << ep);
 
                 let buf = self.registers.configin[ep as usize].read(CONFIGIN::BUFFER);
 
@@ -884,7 +850,7 @@ impl<'a> Usb<'a> {
         }
 
         if irqs.is_set(INTR::PKT_RECEIVED) {
-            while !self.registers.usbstat.is_set(USBSTAT::RX_EMPTY) {
+            if !self.registers.usbstat.is_set(USBSTAT::RX_EMPTY) {
                 let rxinfo = self.registers.rxfifo.extract();
                 let buf = rxinfo.read(RXFIFO::BUFFER);
                 let size = rxinfo.read(RXFIFO::SIZE);
@@ -896,7 +862,6 @@ impl<'a> Usb<'a> {
                     0 => {
                         self.control_ep_receive(ep as usize, buf as usize, size, setup);
                         self.free_buffer(buf as usize);
-                        break;
                     }
                     1..=7 => {
                         let receive_size = match self.descriptors[ep as usize].state.get() {
@@ -908,7 +873,6 @@ impl<'a> Usb<'a> {
                         };
                         self.ep_receive(ep as usize, buf as usize, receive_size, setup);
                         self.free_buffer(buf as usize);
-                        break;
                     }
                     8 => unimplemented!("isochronous endpoint"),
                     _ => unimplemented!(),
@@ -948,12 +912,12 @@ impl<'a> Usb<'a> {
                     }
 
                     self.bufs.set(bufs);
-                    match self.descriptors[ep as usize].state.get() {
+                    match self.descriptors[ep].state.get() {
                         EndpointState::Disabled => unreachable!(),
                         EndpointState::Ctrl(_state) => unreachable!(),
                         EndpointState::Bulk(_in_state, _out_state) => {
-                            if buf_id.is_some() {
-                                self.copy_slice_out_to_hw(ep, buf_id.unwrap(), size)
+                            if let Some(buf) = buf_id {
+                                self.copy_slice_out_to_hw(ep, buf, size)
                             } else {
                                 panic!("No free bufs");
                             };
@@ -968,7 +932,7 @@ impl<'a> Usb<'a> {
 
                 hil::usb::InResult::Delay => {
                     // No packet to send now. Wait for a resume call from the client.
-                    match self.descriptors[ep as usize].state.get() {
+                    match self.descriptors[ep].state.get() {
                         EndpointState::Disabled => unreachable!(),
                         EndpointState::Ctrl(_state) => unreachable!(),
                         EndpointState::Bulk(_in_state, _out_state) => {
@@ -983,7 +947,7 @@ impl<'a> Usb<'a> {
 
                 hil::usb::InResult::Error => {
                     self.in_stall(ep);
-                    match self.descriptors[ep as usize].state.get() {
+                    match self.descriptors[ep].state.get() {
                         EndpointState::Disabled => unreachable!(),
                         EndpointState::Ctrl(_state) => unreachable!(),
                         EndpointState::Bulk(_in_state, _out_state) => {
@@ -1037,7 +1001,7 @@ impl<'a> hil::usb::UsbController<'a> for Usb<'a> {
                 );
 
                 self.set_state(State::Idle(Mode::Device {
-                    speed: speed,
+                    speed,
                     config: DeviceConfig::default(),
                 }))
             }

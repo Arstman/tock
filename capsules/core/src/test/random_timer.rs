@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
-//! Test that a Timer implementation is working by trying a few edge
-//! cases on the interval, including intervals of 1 and 0. Depends
-//! on a working UART and debug! macro. Tries repeating as well as
-//! one-shot Timers.
+//! Test that a Timer implementation is working.
 //!
-//! Author: Philip Levis <plevis@google.com>
-//! Last Modified: 6/22/2020
+//! Test that a Timer implementation is working by trying a few edge
+//! cases on the interval, including intervals of 1 and 0. Depends on
+//! a working UART and debug! macro. Tries repeating as well as
+//! one-shot Timers.
+// Author: Philip Levis <plevis@google.com>
+// Last Modified: 6/22/2020
 
 use core::cell::Cell;
 
@@ -26,7 +27,7 @@ pub struct TestRandomTimer<'a, T: 'a> {
 impl<'a, T: Timer<'a>> TestRandomTimer<'a, T> {
     pub fn new(timer: &'a T, value: usize, ch: char) -> TestRandomTimer<'a, T> {
         TestRandomTimer {
-            timer: timer,
+            timer,
             interval: Cell::new(0),
             counter: Cell::new(0),
             iv: Cell::new(value as u32),
@@ -45,7 +46,7 @@ impl<'a, T: Timer<'a>> TestRandomTimer<'a, T> {
 
         let counter = self.counter.get();
         if counter == 0 {
-            let mut us: u32 = ((iv * 745939) % 115843) as u32;
+            let mut us: u32 = (iv * 745939) % 115843;
             if us % 11 == 0 {
                 // Try delays of zero in 1 of 11 cases
                 us = 0;

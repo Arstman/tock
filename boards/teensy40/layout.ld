@@ -25,7 +25,7 @@ MEMORY
 
 SECTIONS
 {
-  .boot : 
+  .boot :
   {
     /* FlexSPI Configuration Block (defined in source) */
     KEEP(*(.fcb));
@@ -61,7 +61,7 @@ SECTIONS
     _boot_data = .;
     LONG(ORIGIN(rom));          /* Start of image */
     /* Size of the program image (assuming that we also need the boot section) */
-    LONG((_etext-_stext) + (_erelocate-_srelocate) + SIZEOF(.boot));
+    LONG((_etext - _stext) + (_erelocate - _srelocate) + SIZEOF(.boot));
     LONG(0x00000000);           /* Plugin flag (unused) */
     /* End of iMXRT10xx magic
      *
@@ -71,4 +71,4 @@ SECTIONS
   } > rom
 }
 
-INCLUDE ../kernel_layout.ld
+INCLUDE tock_kernel_layout.ld

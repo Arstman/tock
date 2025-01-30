@@ -15,7 +15,7 @@
 //! Usage
 //! -----
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let virtual_pwm_buzzer = static_init!(
@@ -110,10 +110,10 @@ impl<'a, B: hil::buzzer::Buzzer<'a>> Buzzer<'a, B> {
         grant: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
     ) -> Buzzer<'a, B> {
         Buzzer {
-            buzzer: buzzer,
+            buzzer,
             apps: grant,
             active_app: OptionalCell::empty(),
-            max_duration_ms: max_duration_ms,
+            max_duration_ms,
         }
     }
 
@@ -158,7 +158,7 @@ impl<'a, B: hil::buzzer::Buzzer<'a>> Buzzer<'a, B> {
             let processid = appiter.processid();
             let started_command = appiter.enter(|app, _| {
                 // If this app has a pending command let's use it.
-                app.pending_command.take().map_or(false, |command| {
+                app.pending_command.take().is_some_and(|command| {
                     // Mark this driver as being in use.
                     self.active_app.set(processid);
                     // Actually make the buzz happen.
@@ -182,13 +182,8 @@ impl<'a, B: hil::buzzer::Buzzer<'a>> Buzzer<'a, B> {
     /// to the current active_app. Otherwise, a different app is trying to
     /// use the driver while it is already in use, therefore it is not valid.
     pub fn is_valid_app(&self, processid: ProcessId) -> bool {
-        self.active_app.map_or(true, |owning_app| {
-            if owning_app == &processid {
-                true
-            } else {
-                false
-            }
-        })
+        self.active_app
+            .map_or(true, |owning_app| owning_app == processid)
     }
 }
 

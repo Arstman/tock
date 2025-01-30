@@ -16,12 +16,16 @@
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
 
+use core::ptr::{addr_of, addr_of_mut};
+
 use capsules_core::virtualizers::virtual_aes_ccm::MuxAES128CCM;
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
+use capsules_core::virtualizers::virtual_spi::VirtualSpiMasterDevice;
 use kernel::component::Component;
 use kernel::deferred_call::DeferredCallClient;
 use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedHigh;
+use kernel::hil::screen::Screen;
 use kernel::hil::symmetric_encryption::AES128;
 use kernel::hil::time::Counter;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
@@ -30,7 +34,6 @@ use kernel::scheduler::round_robin::RoundRobinSched;
 use kernel::{capabilities, create_capability, debug, debug_gpio, debug_verbose, static_init};
 use nrf52840::gpio::Pin;
 use nrf52840::interrupt_service::Nrf52840DefaultPeripherals;
-use nrf52_components;
 
 // The backlight LED
 const LED1_PIN: Pin = Pin::P0_08;
@@ -45,16 +48,19 @@ const BUTTON_PIN: Pin = Pin::P0_17;
 const I2C_TEMP_SDA_PIN: Pin = Pin::P1_15;
 const I2C_TEMP_SCL_PIN: Pin = Pin::P0_02;
 
-// Constants related to the configuration of the 15.4 network stack
+// Constants related to the configuration of the 15.4 network stack; DEFAULT_EXT_SRC_MAC
+// should be replaced by an extended src address generated from device serial number
 const SRC_MAC: u16 = 0xf00f;
 const PAN_ID: u16 = 0xABCD;
+const DEFAULT_EXT_SRC_MAC: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
 
 /// UART Writer
 pub mod io;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
+const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
+    capsules_system::process_policies::PanicFaultPolicy {};
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 8;
@@ -65,32 +71,35 @@ static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS]
 // Static reference to chip for panic dumps
 static mut CHIP: Option<&'static nrf52840::chip::NRF52<Nrf52840DefaultPeripherals>> = None;
 // Static reference to process printer for panic dumps
-static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
+static mut PROCESS_PRINTER: Option<&'static capsules_system::process_printer::ProcessPrinterText> =
+    None;
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
 
-// Function for the process console to use to reboot the board
-fn reset() -> ! {
-    unsafe {
-        cortexm4::scb::reset();
-    }
-    loop {
-        cortexm4::support::nop();
-    }
-}
+type Bmp280Sensor = components::bmp280::Bmp280ComponentType<
+    VirtualMuxAlarm<'static, nrf52840::rtc::Rtc<'static>>,
+    capsules_core::virtualizers::virtual_i2c::I2CDevice<'static, nrf52840::i2c::TWI<'static>>,
+>;
+type TemperatureDriver = components::temperature::TemperatureComponentType<Bmp280Sensor>;
+type RngDriver = components::rng::RngComponentType<nrf52840::trng::Trng<'static>>;
+
+type Ieee802154Driver = components::ieee802154::Ieee802154ComponentType<
+    nrf52840::ieee802154_radio::Radio<'static>,
+    nrf52840::aes::AesECB<'static>,
+>;
 
 /// Supported drivers by the platform
 pub struct Platform {
-    temperature: &'static capsules_extra::temperature::TemperatureSensor<'static>,
+    temperature: &'static TemperatureDriver,
     ble_radio: &'static capsules_extra::ble_advertising_driver::BLE<
         'static,
         nrf52840::ble_radio::Radio<'static>,
         VirtualMuxAlarm<'static, nrf52840::rtc::Rtc<'static>>,
     >,
-    ieee802154_radio: &'static capsules_extra::ieee802154::RadioDriver<'static>,
+    ieee802154_radio: &'static Ieee802154Driver,
     button: &'static capsules_core::button::Button<'static, nrf52840::gpio::GPIOPin<'static>>,
     pconsole: &'static capsules_core::process_console::ProcessConsole<
         'static,
@@ -105,7 +114,7 @@ pub struct Platform {
         LedHigh<'static, nrf52840::gpio::GPIOPin<'static>>,
         2,
     >,
-    rng: &'static capsules_core::rng::RngDriver<'static>,
+    rng: &'static RngDriver,
     ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
     analog_comparator: &'static capsules_extra::analog_comparator::AnalogComparator<
         'static,
@@ -118,6 +127,7 @@ pub struct Platform {
             nrf52840::rtc::Rtc<'static>,
         >,
     >,
+    screen: &'static capsules_extra::screen::Screen<'static>,
     scheduler: &'static RoundRobinSched<'static>,
     systick: cortexm4::systick::SysTick,
 }
@@ -138,6 +148,7 @@ impl SyscallDriverLookup for Platform {
             capsules_extra::ieee802154::DRIVER_NUM => f(Some(self.ieee802154_radio)),
             capsules_extra::temperature::DRIVER_NUM => f(Some(self.temperature)),
             capsules_extra::analog_comparator::DRIVER_NUM => f(Some(self.analog_comparator)),
+            capsules_extra::screen::DRIVER_NUM => f(Some(self.screen)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
@@ -150,22 +161,18 @@ impl KernelResources<nrf52840::chip::NRF52<'static, Nrf52840DefaultPeripherals<'
     type SyscallDriverLookup = Self;
     type SyscallFilter = ();
     type ProcessFault = ();
-    type CredentialsCheckingPolicy = ();
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm4::systick::SysTick;
     type WatchDog = ();
     type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
-        &self
+        self
     }
     fn syscall_filter(&self) -> &Self::SyscallFilter {
         &()
     }
     fn process_fault(&self) -> &Self::ProcessFault {
-        &()
-    }
-    fn credentials_checking_policy(&self) -> &'static Self::CredentialsCheckingPolicy {
         &()
     }
     fn scheduler(&self) -> &Self::Scheduler {
@@ -186,28 +193,28 @@ impl KernelResources<nrf52840::chip::NRF52<'static, Nrf52840DefaultPeripherals<'
 /// removed when this function returns. Otherwise, the stack space used for
 /// these static_inits is wasted.
 #[inline(never)]
-unsafe fn create_peripherals() -> &'static mut Nrf52840DefaultPeripherals<'static> {
+pub unsafe fn start() -> (
+    &'static kernel::Kernel,
+    Platform,
+    &'static nrf52840::chip::NRF52<'static, Nrf52840DefaultPeripherals<'static>>,
+) {
+    nrf52840::init();
+
+    let ieee802154_ack_buf = static_init!(
+        [u8; nrf52840::ieee802154_radio::ACK_BUF_SIZE],
+        [0; nrf52840::ieee802154_radio::ACK_BUF_SIZE]
+    );
     // Initialize chip peripheral drivers
     let nrf52840_peripherals = static_init!(
         Nrf52840DefaultPeripherals,
-        Nrf52840DefaultPeripherals::new()
+        Nrf52840DefaultPeripherals::new(ieee802154_ack_buf)
     );
-
-    nrf52840_peripherals
-}
-
-/// Main function called after RAM initialized.
-#[no_mangle]
-pub unsafe fn main() {
-    nrf52840::init();
-
-    let nrf52840_peripherals = create_peripherals();
 
     // set up circular peripheral dependencies
     nrf52840_peripherals.init();
     let base_peripherals = &nrf52840_peripherals.nrf52;
 
-    let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
+    let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&*addr_of!(PROCESSES)));
 
     // GPIOs
     let gpio = components::gpio::GpioComponent::new(
@@ -262,7 +269,6 @@ pub unsafe fn main() {
     // Create capabilities that the board needs to call certain protected kernel
     // functions.
 
-    let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
     let memory_allocation_capability = create_capability!(capabilities::MemoryAllocationCapability);
 
     let gpio_port = &nrf52840_peripherals.gpio_port;
@@ -294,7 +300,7 @@ pub unsafe fn main() {
         // TODO: This is inherently unsafe as it aliases the mutable reference to rtt_memory. This
         // aliases reference is only used inside a panic handler, which should be OK, but maybe we
         // should use a const reference to rtt_memory and leverage interior mutability instead.
-        self::io::set_rtt_memory(&mut *rtt_memory.get_rtt_memory_ptr());
+        self::io::set_rtt_memory(&*rtt_memory.get_rtt_memory_ptr());
 
         components::segger_rtt::SeggerRttComponent::new(mux_alarm, rtt_memory)
             .finalize(components::segger_rtt_component_static!(nrf52840::rtc::Rtc))
@@ -309,7 +315,7 @@ pub unsafe fn main() {
         uart_mux,
         mux_alarm,
         process_printer,
-        Some(reset),
+        Some(cortexm4::support::reset),
     )
     .finalize(components::process_console_component_static!(
         nrf52840::rtc::Rtc<'static>
@@ -347,10 +353,11 @@ pub unsafe fn main() {
     let (ieee802154_radio, _mux_mac) = components::ieee802154::Ieee802154Component::new(
         board_kernel,
         capsules_extra::ieee802154::DRIVER_NUM,
-        &base_peripherals.ieee802154_radio,
+        &nrf52840_peripherals.ieee802154_radio,
         aes_mux,
         PAN_ID,
         SRC_MAC,
+        DEFAULT_EXT_SRC_MAC,
     )
     .finalize(components::ieee802154_component_static!(
         nrf52840::ieee802154_radio::Radio,
@@ -364,7 +371,9 @@ pub unsafe fn main() {
         capsules_extra::temperature::DRIVER_NUM,
         &base_peripherals.temp,
     )
-    .finalize(components::temperature_component_static!());
+    .finalize(components::temperature_component_static!(
+        nrf52840::temperature::Temp
+    ));
 
     let sensors_i2c_bus = static_init!(
         capsules_core::virtualizers::virtual_i2c::MuxI2C<'static, nrf52840::i2c::TWI>,
@@ -393,14 +402,14 @@ pub unsafe fn main() {
         capsules_extra::temperature::DRIVER_NUM,
         bmp280,
     )
-    .finalize(components::temperature_component_static!());
+    .finalize(components::temperature_component_static!(Bmp280Sensor));
 
     let rng = components::rng::RngComponent::new(
         board_kernel,
         capsules_core::rng::DRIVER_NUM,
         &base_peripherals.trng,
     )
-    .finalize(components::rng_component_static!());
+    .finalize(components::rng_component_static!(nrf52840::trng::Trng));
 
     // Initialize AC using AIN5 (P0.29) as VIN+ and VIN- as AIN0 (P0.02)
     // These are hardcoded pin assignments specified in the driver
@@ -408,7 +417,7 @@ pub unsafe fn main() {
         &base_peripherals.acomp,
         components::analog_comparator_component_helper!(
             nrf52840::acomp::Channel,
-            &nrf52840::acomp::CHANNEL_AC0
+            &*addr_of!(nrf52840::acomp::CHANNEL_AC0)
         ),
         board_kernel,
         capsules_extra::analog_comparator::DRIVER_NUM,
@@ -419,7 +428,7 @@ pub unsafe fn main() {
 
     nrf52_components::NrfClockComponent::new(&base_peripherals.clock).finalize(());
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&*addr_of!(PROCESSES))
         .finalize(components::round_robin_component_static!(NUM_PROCS));
 
     let periodic_virtual_alarm = static_init!(
@@ -427,6 +436,50 @@ pub unsafe fn main() {
         capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm::new(mux_alarm)
     );
     periodic_virtual_alarm.setup();
+
+    let screen = {
+        let mux_spi = components::spi::SpiMuxComponent::new(&base_peripherals.spim2)
+            .finalize(components::spi_mux_component_static!(nrf52840::spi::SPIM));
+
+        use kernel::hil::spi::SpiMaster;
+        base_peripherals
+            .spim2
+            .set_rate(1_000_000)
+            .expect("SPIM2 set rate");
+
+        base_peripherals.spim2.configure(
+            nrf52840::pinmux::Pinmux::new(Pin::P0_27 as u32),
+            nrf52840::pinmux::Pinmux::new(Pin::P0_28 as u32),
+            nrf52840::pinmux::Pinmux::new(Pin::P0_26 as u32),
+        );
+
+        let disp_pin = &nrf52840_peripherals.gpio_port[Pin::P0_07];
+        let cs_pin = &nrf52840_peripherals.gpio_port[Pin::P0_05];
+
+        let display = components::lpm013m126::Lpm013m126Component::new(
+            mux_spi,
+            cs_pin,
+            disp_pin,
+            &nrf52840_peripherals.gpio_port[Pin::P0_06],
+            mux_alarm,
+        )
+        .finalize(components::lpm013m126_component_static!(
+            nrf52840::rtc::Rtc<'static>,
+            nrf52840::gpio::GPIOPin,
+            nrf52840::spi::SPIM
+        ));
+
+        let screen = components::screen::ScreenComponent::new(
+            board_kernel,
+            capsules_extra::screen::DRIVER_NUM,
+            display,
+            None,
+        )
+        .finalize(components::screen_component_static!(4096));
+        // Power on screen if not already powered
+        let _ = display.set_power(true);
+        screen
+    };
 
     let platform = Platform {
         temperature,
@@ -440,6 +493,7 @@ pub unsafe fn main() {
         rng,
         alarm,
         analog_comparator,
+        screen,
         ipc: kernel::ipc::IPC::new(
             board_kernel,
             kernel::ipc::DRIVER_NUM,
@@ -470,14 +524,14 @@ pub unsafe fn main() {
                 board_kernel,
                 chip,
                 core::slice::from_raw_parts(
-                    &_sapps as *const u8,
-                    &_eapps as *const u8 as usize - &_sapps as *const u8 as usize,
+                    core::ptr::addr_of!(_sapps),
+                    core::ptr::addr_of!(_eapps) as usize - core::ptr::addr_of!(_sapps) as usize,
                 ),
                 core::slice::from_raw_parts_mut(
-                    &mut _sappmem as *mut u8,
-                    &_eappmem as *const u8 as usize - &_sappmem as *const u8 as usize,
+                    core::ptr::addr_of_mut!(_sappmem),
+                    core::ptr::addr_of!(_eappmem) as usize - core::ptr::addr_of!(_sappmem) as usize,
                 ),
-                &mut PROCESSES,
+                &mut *addr_of_mut!(PROCESSES),
                 &FAULT_RESPONSE,
                 &process_management_capability,
             )
@@ -490,7 +544,7 @@ pub unsafe fn main() {
 
     let _ = platform.pconsole.start();
     debug!("Initialization complete. Entering main loop\r");
-    debug!("{}", &nrf52840::ficr::FICR_INSTANCE);
+    debug!("{}", &*addr_of!(nrf52840::ficr::FICR_INSTANCE));
 
     load_processes(board_kernel, chip);
     // These symbols are defined in the linker script.
@@ -505,5 +559,14 @@ pub unsafe fn main() {
         static _eappmem: u8;
     }
 
+    (board_kernel, platform, chip)
+}
+
+/// Main function called after RAM initialized.
+#[no_mangle]
+pub unsafe fn main() {
+    let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
+
+    let (board_kernel, platform, chip) = start();
     board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }

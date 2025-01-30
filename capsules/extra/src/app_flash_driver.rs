@@ -16,7 +16,7 @@
 //! Usage
 //! -----
 //!
-//! ```
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let app_flash_buffer = static_init!([u8; 512], [0; 512]);
@@ -39,8 +39,17 @@ use kernel::{ErrorCode, ProcessId};
 use capsules_core::driver;
 pub const DRIVER_NUM: usize = driver::NUM::AppFlash as usize;
 
+/// IDs for subscribed upcalls.
+mod upcall {
+    /// `write_done` callback.
+    pub const WRITE_DONE: usize = 0;
+    /// Number of upcalls.
+    pub const COUNT: u8 = 1;
+}
+
 /// Ids for read-only allow buffers
 mod ro_allow {
+    /// Set write buffer. This entire buffer will be written to flash.
     pub const BUFFER: usize = 0;
     /// The number of allow buffers the kernel stores for this grant
     pub const COUNT: u8 = 1;
@@ -54,7 +63,12 @@ pub struct App {
 
 pub struct AppFlash<'a> {
     driver: &'a dyn hil::nonvolatile_storage::NonvolatileStorage<'a>,
-    apps: Grant<App, UpcallCount<1>, AllowRoCount<{ ro_allow::COUNT }>, AllowRwCount<0>>,
+    apps: Grant<
+        App,
+        UpcallCount<{ upcall::COUNT }>,
+        AllowRoCount<{ ro_allow::COUNT }>,
+        AllowRwCount<0>,
+    >,
     current_app: OptionalCell<ProcessId>,
     buffer: TakeCell<'static, [u8]>,
 }
@@ -62,11 +76,16 @@ pub struct AppFlash<'a> {
 impl<'a> AppFlash<'a> {
     pub fn new(
         driver: &'a dyn hil::nonvolatile_storage::NonvolatileStorage<'a>,
-        grant: Grant<App, UpcallCount<1>, AllowRoCount<{ ro_allow::COUNT }>, AllowRwCount<0>>,
+        grant: Grant<
+            App,
+            UpcallCount<{ upcall::COUNT }>,
+            AllowRoCount<{ ro_allow::COUNT }>,
+            AllowRwCount<0>,
+        >,
         buffer: &'static mut [u8],
     ) -> AppFlash<'a> {
         AppFlash {
-            driver: driver,
+            driver,
             apps: grant,
             current_app: OptionalCell::empty(),
             buffer: TakeCell::new(buffer),
@@ -104,9 +123,7 @@ impl<'a> AppFlash<'a> {
                                     .map_or(Err(ErrorCode::RESERVE), |buffer| {
                                         let length = cmp::min(buffer.len(), app_buffer.len());
                                         let d = &app_buffer[0..length];
-                                        for (i, c) in
-                                            buffer.as_mut()[0..length].iter_mut().enumerate()
-                                        {
+                                        for (i, c) in buffer[0..length].iter_mut().enumerate() {
                                             *c = d[i].get();
                                         }
 
@@ -117,7 +134,7 @@ impl<'a> AppFlash<'a> {
                         .unwrap_or(Err(ErrorCode::RESERVE))
                 } else {
                     // Queue this request for later.
-                    if app.pending_command == true {
+                    if app.pending_command {
                         Err(ErrorCode::NOMEM)
                     } else {
                         app.pending_command = true;
@@ -140,7 +157,7 @@ impl hil::nonvolatile_storage::NonvolatileStorageClient for AppFlash<'_> {
         // Notify the current application that the command finished.
         self.current_app.take().map(|processid| {
             let _ = self.apps.enter(processid, |_app, upcalls| {
-                upcalls.schedule_upcall(0, (0, 0, 0)).ok();
+                upcalls.schedule_upcall(upcall::WRITE_DONE, (0, 0, 0)).ok();
             });
         });
 
@@ -157,16 +174,14 @@ impl hil::nonvolatile_storage::NonvolatileStorageClient for AppFlash<'_> {
                         .get_readonly_processbuffer(ro_allow::BUFFER)
                         .and_then(|buffer| {
                             buffer.enter(|app_buffer| {
-                                self.buffer.take().map_or(false, |buffer| {
+                                self.buffer.take().is_some_and(|buffer| {
                                     if app_buffer.len() != 512 {
                                         false
                                     } else {
                                         // Copy contents to internal buffer and write it.
                                         let length = cmp::min(buffer.len(), app_buffer.len());
                                         let d = &app_buffer[0..length];
-                                        for (i, c) in
-                                            buffer.as_mut()[0..length].iter_mut().enumerate()
-                                        {
+                                        for (i, c) in buffer[0..length].iter_mut().enumerate() {
                                             *c = d[i].get();
                                         }
 
@@ -194,23 +209,11 @@ impl hil::nonvolatile_storage::NonvolatileStorageClient for AppFlash<'_> {
 }
 
 impl SyscallDriver for AppFlash<'_> {
-    /// Setup buffer to write from.
-    ///
-    /// ### `allow_num`
-    ///
-    /// - `0`: Set write buffer. This entire buffer will be written to flash.
-
-    // Setup callbacks.
-    //
-    // ### `subscribe_num`
-    //
-    // - `0`: Set a write_done callback.
-
     /// App flash control.
     ///
     /// ### `command_num`
     ///
-    /// - `0`: Driver check.
+    /// - `0`: Driver existence check.
     /// - `1`: Write the memory from the `allow` buffer to the address in flash.
     fn command(
         &self,
@@ -220,11 +223,10 @@ impl SyscallDriver for AppFlash<'_> {
         processid: ProcessId,
     ) -> CommandReturn {
         match command_num {
-            0 /* This driver exists. */ => {
-                CommandReturn::success()
-            }
+            0 => CommandReturn::success(),
 
-            1 /* Write to flash from the allowed buffer */ => {
+            1 => {
+                // Write to flash from the allowed buffer
                 let flash_address = arg1;
 
                 let res = self.enqueue_write(flash_address, processid);
@@ -235,7 +237,7 @@ impl SyscallDriver for AppFlash<'_> {
                 }
             }
 
-            _ /* Unknown command num */ => CommandReturn::failure(ErrorCode::NOSUPPORT),
+            _ => CommandReturn::failure(ErrorCode::NOSUPPORT),
         }
     }
 

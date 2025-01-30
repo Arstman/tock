@@ -23,6 +23,7 @@ use kernel::hil::spi::SpiMasterClient;
 use kernel::hil::spi::SpiSlaveClient;
 use kernel::platform::chip::ClockInterface;
 use kernel::utilities::cells::OptionalCell;
+use kernel::utilities::leasable_buffer::SubSliceMut;
 use kernel::utilities::peripheral_management::{PeripheralManagement, PeripheralManager};
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{self, register_bitfields, ReadOnly, ReadWrite, WriteOnly};
@@ -179,6 +180,12 @@ pub enum Peripheral {
     Peripheral3,
 }
 
+impl spi::cs::IntoChipSelect<Peripheral, spi::cs::ActiveLow> for Peripheral {
+    fn into_cs(self) -> Peripheral {
+        self
+    }
+}
+
 #[derive(Copy, Clone, PartialEq)]
 pub enum SpiRole {
     SpiMaster,
@@ -208,7 +215,7 @@ impl PeripheralManagement<pm::Clock> for SpiHw<'_> {
     type RegisterType = SpiRegisters;
 
     fn get_registers(&self) -> &SpiRegisters {
-        &*SPI_BASE
+        &SPI_BASE
     }
 
     fn get_clock(&self) -> &pm::Clock {
@@ -267,7 +274,7 @@ impl<'a> SpiHw<'a> {
     }
 
     fn enable(&self) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
 
         spi.registers.cr.write(Control::SPIEN::SET);
 
@@ -277,7 +284,7 @@ impl<'a> SpiHw<'a> {
     }
 
     fn disable(&self) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
 
         // TODO(alevy): we actually probably want to do this asynchrounously but
         // because we're using DMA, a transfer may have completed with a byte
@@ -324,21 +331,21 @@ impl<'a> SpiHw<'a> {
         if clock % real_rate != 0 && scbr != 0xFF {
             scbr += 1;
         }
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         csr.modify(ChipSelectParams::SCBR.val(scbr));
         clock / scbr
     }
 
     fn get_baud_rate(&self) -> u32 {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let clock = 48000000;
         let scbr = self.get_active_csr(spi).read(ChipSelectParams::SCBR);
         clock / scbr
     }
 
     fn set_polarity(&self, polarity: ClockPolarity) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         match polarity {
             ClockPolarity::IdleHigh => csr.modify(ChipSelectParams::CPOL::InactiveHigh),
@@ -347,7 +354,7 @@ impl<'a> SpiHw<'a> {
     }
 
     fn get_polarity(&self) -> ClockPolarity {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         if csr.matches_all(ChipSelectParams::CPOL::InactiveLow) {
             ClockPolarity::IdleLow
@@ -357,7 +364,7 @@ impl<'a> SpiHw<'a> {
     }
 
     fn set_phase(&self, phase: ClockPhase) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         match phase {
             ClockPhase::SampleLeading => csr.modify(ChipSelectParams::NCPHA::CaptureLeading),
@@ -366,26 +373,12 @@ impl<'a> SpiHw<'a> {
     }
 
     fn get_phase(&self) -> ClockPhase {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         if csr.matches_all(ChipSelectParams::NCPHA::CaptureTrailing) {
             ClockPhase::SampleTrailing
         } else {
             ClockPhase::SampleLeading
-        }
-    }
-
-    pub fn set_active_peripheral(&self, peripheral: Peripheral) {
-        // Slave cannot set active peripheral
-        if self.role.get() == SpiRole::SpiMaster {
-            let spi = &SpiRegisterManager::new(&self);
-            let mr = match peripheral {
-                Peripheral::Peripheral0 => Mode::PCS::PCS0,
-                Peripheral::Peripheral1 => Mode::PCS::PCS1,
-                Peripheral::Peripheral2 => Mode::PCS::PCS2,
-                Peripheral::Peripheral3 => Mode::PCS::PCS3,
-            };
-            spi.registers.mr.modify(mr);
         }
     }
 
@@ -429,7 +422,7 @@ impl<'a> SpiHw<'a> {
     }
 
     pub fn handle_interrupt(&self) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
 
         self.slave_client.map(|client| {
             if spi.registers.sr.is_set(Status::NSSR) {
@@ -451,34 +444,25 @@ impl<'a> SpiHw<'a> {
     // the caller, and the caller may want to be able write into it.
     fn read_write_bytes(
         &self,
-        write_buffer: Option<&'static mut [u8]>,
-        read_buffer: Option<&'static mut [u8]>,
-        len: usize,
+        write_buffer: Option<SubSliceMut<'static, u8>>,
+        read_buffer: Option<SubSliceMut<'static, u8>>,
     ) -> Result<
         (),
         (
             ErrorCode,
-            Option<&'static mut [u8]>,
-            Option<&'static mut [u8]>,
+            Option<SubSliceMut<'static, u8>>,
+            Option<SubSliceMut<'static, u8>>,
         ),
     > {
-        if write_buffer.is_none() && read_buffer.is_none() {
-            return Err((ErrorCode::INVAL, write_buffer, read_buffer));
-        }
+        let count = match (&write_buffer, &read_buffer) {
+            (Some(ref wb), Some(ref rb)) => cmp::min(wb.len(), rb.len()),
+            (Some(ref wb), None) => wb.len(),
+            (None, Some(ref rb)) => rb.len(),
+            (None, None) => return Err((ErrorCode::INVAL, write_buffer, read_buffer)),
+        };
 
         // Start by enabling the SPI driver.
         self.enable();
-
-        // Determine how many bytes to move based on the shortest of the
-        // write_buffer length, the read_buffer length, and the user requested
-        // len.
-        let mut count: usize = len;
-        write_buffer
-            .as_ref()
-            .map(|buf| count = cmp::min(count, buf.len()));
-        read_buffer
-            .as_ref()
-            .map(|buf| count = cmp::min(count, buf.len()));
 
         // Configure DMA to transfer that many bytes.
         self.dma_length.set(count);
@@ -499,19 +483,19 @@ impl<'a> SpiHw<'a> {
                 .set(self.transfers_in_progress.get() + 1);
             self.dma_read.map(move |read| {
                 read.enable();
-                read.do_transfer(DMAPeripheral::SPI_RX, rbuf, count);
+                read.do_transfer(DMAPeripheral::SPI_RX, rbuf.take(), count);
             });
         });
 
         // The ordering of these operations matters.
         // For transfers 4 bytes or longer, this will work as expected.
         // For shorter transfers, the first byte will be missing.
-        write_buffer.map(|wbuf| {
+        write_buffer.map(|buf| {
             self.transfers_in_progress
                 .set(self.transfers_in_progress.get() + 1);
             self.dma_write.map(move |write| {
                 write.enable();
-                write.do_transfer(DMAPeripheral::SPI_TX, wbuf, count);
+                write.do_transfer(DMAPeripheral::SPI_TX, buf.take(), count);
             });
         });
 
@@ -520,7 +504,7 @@ impl<'a> SpiHw<'a> {
 }
 
 impl<'a> spi::SpiMaster<'a> for SpiHw<'a> {
-    type ChipSelect = u8;
+    type ChipSelect = Peripheral;
 
     fn set_client(&self, client: &'a dyn SpiMasterClient) {
         self.client.set(client);
@@ -529,7 +513,7 @@ impl<'a> spi::SpiMaster<'a> for SpiHw<'a> {
     /// By default, initialize SPI to operate at 40KHz, clock is
     /// idle on low, and sample on the leading edge.
     fn init(&self) -> Result<(), ErrorCode> {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         self.init_as_role(spi, SpiRole::SpiMaster);
         Ok(())
     }
@@ -541,7 +525,7 @@ impl<'a> spi::SpiMaster<'a> for SpiHw<'a> {
     /// Write a byte to the SPI and discard the read; if an
     /// asynchronous operation is outstanding, do nothing.
     fn write_byte(&self, out_byte: u8) -> Result<(), ErrorCode> {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
 
         let tdr = (out_byte as u32) & spi_consts::tdr::TD;
         // Wait for data to leave TDR and enter serializer, so TDR is free
@@ -560,7 +544,7 @@ impl<'a> spi::SpiMaster<'a> for SpiHw<'a> {
     /// Write a byte to the SPI and return the read; if an
     /// asynchronous operation is outstanding, do nothing.
     fn read_write_byte(&self, val: u8) -> Result<u8, ErrorCode> {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
 
         self.write_byte(val)?;
         while !spi.registers.sr.is_set(Status::RDRF) {}
@@ -579,19 +563,29 @@ impl<'a> spi::SpiMaster<'a> for SpiHw<'a> {
     // the caller, and the caller may want to be able write into it.
     fn read_write_bytes(
         &self,
-        write_buffer: &'static mut [u8],
-        read_buffer: Option<&'static mut [u8]>,
-        len: usize,
-    ) -> Result<(), (ErrorCode, &'static mut [u8], Option<&'static mut [u8]>)> {
+        write_buffer: SubSliceMut<'static, u8>,
+        read_buffer: Option<SubSliceMut<'static, u8>>,
+    ) -> Result<
+        (),
+        (
+            ErrorCode,
+            SubSliceMut<'static, u8>,
+            Option<SubSliceMut<'static, u8>>,
+        ),
+    > {
         // If busy, don't start.
         if self.is_busy() {
             return Err((ErrorCode::BUSY, write_buffer, read_buffer));
         }
 
         if let Err((err, write_buffer, read_buffer)) =
-            self.read_write_bytes(Some(write_buffer), read_buffer, len)
+            self.read_write_bytes(Some(write_buffer), read_buffer)
         {
-            Err((err, write_buffer.unwrap(), read_buffer))
+            Err((
+                err,
+                write_buffer.unwrap_or((&mut [] as &mut [u8]).into()),
+                read_buffer,
+            ))
         } else {
             Ok(())
         }
@@ -624,30 +618,31 @@ impl<'a> spi::SpiMaster<'a> for SpiHw<'a> {
     }
 
     fn hold_low(&self) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         csr.modify(ChipSelectParams::CSAAT::ActiveAfterTransfer);
     }
 
     fn release_low(&self) {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         let csr = self.get_active_csr(spi);
         csr.modify(ChipSelectParams::CSAAT::InactiveAfterTransfer);
     }
 
     fn specify_chip_select(&self, cs: Self::ChipSelect) -> Result<(), ErrorCode> {
-        match match cs {
-            0 => Some(Peripheral::Peripheral0),
-            1 => Some(Peripheral::Peripheral1),
-            2 => Some(Peripheral::Peripheral2),
-            3 => Some(Peripheral::Peripheral3),
-            _ => None,
-        } {
-            Some(peripheral_number) => {
-                self.set_active_peripheral(peripheral_number);
-                Ok(())
-            }
-            None => Err(ErrorCode::INVAL),
+        // Slave cannot set active peripheral
+        if self.role.get() == SpiRole::SpiMaster {
+            let spi = &SpiRegisterManager::new(self);
+            let mr = match cs {
+                Peripheral::Peripheral0 => Mode::PCS::PCS0,
+                Peripheral::Peripheral1 => Mode::PCS::PCS1,
+                Peripheral::Peripheral2 => Mode::PCS::PCS2,
+                Peripheral::Peripheral3 => Mode::PCS::PCS3,
+            };
+            spi.registers.mr.modify(mr);
+            Ok(())
+        } else {
+            Err(ErrorCode::INVAL)
         }
     }
 }
@@ -663,7 +658,7 @@ impl<'a> spi::SpiSlave<'a> for SpiHw<'a> {
     }
 
     fn init(&self) -> Result<(), ErrorCode> {
-        let spi = &SpiRegisterManager::new(&self);
+        let spi = &SpiRegisterManager::new(self);
         self.init_as_role(spi, SpiRole::SpiSlave);
         Ok(())
     }
@@ -671,7 +666,7 @@ impl<'a> spi::SpiSlave<'a> for SpiHw<'a> {
     /// This sets the value in the TDR register, to be sent as soon as the
     /// chip select pin is low.
     fn set_write_byte(&self, write_byte: u8) {
-        let spi = SpiRegisterManager::new(&self);
+        let spi = SpiRegisterManager::new(self);
         spi.registers.tdr.set(write_byte as u32);
     }
 
@@ -693,7 +688,26 @@ impl<'a> spi::SpiSlave<'a> for SpiHw<'a> {
             Option<&'static mut [u8]>,
         ),
     > {
-        self.read_write_bytes(write_buffer, read_buffer, len)
+        let write_buffer = write_buffer.map(|b| {
+            let mut buf: SubSliceMut<u8> = b.into();
+            if buf.len() > len {
+                buf.slice(..len);
+            }
+            buf
+        });
+        let read_buffer = read_buffer.map(|b| {
+            let mut buf: SubSliceMut<u8> = b.into();
+            if buf.len() > len {
+                buf.slice(..len);
+            }
+            buf
+        });
+
+        if let Err((e, mwb, mrb)) = self.read_write_bytes(write_buffer, read_buffer) {
+            Err((e, mwb.map(|b| b.take()), mrb.map(|b| b.take())))
+        } else {
+            Ok(())
+        }
     }
 
     fn set_polarity(&self, polarity: ClockPolarity) -> Result<(), ErrorCode> {
@@ -747,7 +761,7 @@ impl DMAClient for SpiHw<'_> {
                 SpiRole::SpiMaster => {
                     self.client.map(|cb| {
                         txbuf.map(|txbuf| {
-                            cb.read_write_done(txbuf, rxbuf, len, Ok(()));
+                            cb.read_write_done(txbuf.into(), rxbuf.map(|b| b.into()), Ok(len));
                         });
                     });
                 }
