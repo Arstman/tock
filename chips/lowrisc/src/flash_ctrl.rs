@@ -286,9 +286,10 @@ pub const FLASH_MP_MAX_CFGS: usize = 8;
 pub const FLASH_PROG_WINDOW_SIZE: usize = 16;
 pub const FLASH_PROG_WINDOW_MASK: u32 = 0xFFFFFFF0;
 
-pub struct LowRiscPage(pub [u8; PAGE_SIZE as usize]);
+pub struct LowRiscPage(pub [u8; PAGE_SIZE]);
 
 /// Defines region permissions for flash memory protection.
+///
 /// To be used when requesting the flash controller to set
 /// specific permissions for a regions, or when reading
 /// the existing permission associated with a region.
@@ -310,9 +311,7 @@ pub struct FlashMPConfig {
 
 impl Default for LowRiscPage {
     fn default() -> Self {
-        Self {
-            0: [0; PAGE_SIZE as usize],
-        }
+        Self([0; PAGE_SIZE])
     }
 }
 
@@ -367,7 +366,7 @@ pub struct FlashCtrl<'a> {
     region_num: FlashRegion,
 }
 
-impl<'a> FlashCtrl<'a> {
+impl FlashCtrl<'_> {
     pub fn new(base: StaticRef<FlashCtrlRegisters>, region_num: FlashRegion) -> Self {
         FlashCtrl {
             registers: base,
@@ -526,7 +525,7 @@ impl<'a> FlashCtrl<'a> {
             if let Some(buf) = read_buf {
                 // We were doing a read
                 self.flash_client.map(move |client| {
-                    client.read_complete(buf, error);
+                    client.read_complete(buf, Err(error));
                 });
             }
 
@@ -534,14 +533,14 @@ impl<'a> FlashCtrl<'a> {
             if let Some(buf) = write_buf {
                 // We were doing a write
                 self.flash_client.map(move |client| {
-                    client.write_complete(buf, error);
+                    client.write_complete(buf, Err(error));
                 });
             }
 
             if self.registers.control.matches_all(CONTROL::OP::ERASE) {
                 // We were doing an erase
                 self.flash_client.map(move |client| {
-                    client.erase_complete(error);
+                    client.erase_complete(Err(error));
                 });
             }
         }
@@ -579,7 +578,7 @@ impl<'a> FlashCtrl<'a> {
                     CONTROL::OP::PROG
                         + CONTROL::PARTITION_SEL::DATA
                         + CONTROL::INFO_SEL::CLEAR
-                        + CONTROL::NUM.val(transaction_word_len as u32 - 1)
+                        + CONTROL::NUM.val(transaction_word_len - 1)
                         + CONTROL::START::CLEAR,
                 );
 
@@ -624,7 +623,7 @@ impl<'a> FlashCtrl<'a> {
                         self.registers.op_status.set(0);
                         // We have all of the data, call the client
                         self.flash_client.map(move |client| {
-                            client.read_complete(buf, hil::flash::Error::CommandComplete);
+                            client.read_complete(buf, Ok(()));
                         });
                     } else {
                         // Still waiting on data, keep waiting
@@ -640,7 +639,7 @@ impl<'a> FlashCtrl<'a> {
                         self.registers.op_status.set(0);
                         // We sent all of the data, call the client
                         self.flash_client.map(move |client| {
-                            client.write_complete(buf, hil::flash::Error::CommandComplete);
+                            client.write_complete(buf, Ok(()));
                         });
                     } else {
                         // Still writing data, keep trying
@@ -650,7 +649,7 @@ impl<'a> FlashCtrl<'a> {
                 }
             } else if self.registers.control.matches_all(CONTROL::OP::ERASE) {
                 self.flash_client.map(move |client| {
-                    client.erase_complete(hil::flash::Error::CommandComplete);
+                    client.erase_complete(Ok(()));
                 });
             }
         }
@@ -1102,16 +1101,12 @@ impl hil::flash::Flash for FlashCtrl<'_> {
 
         if !self.data_configured.get() {
             // If we aren't configured yet, configure now
-            if let Err(e) = self.configure_data_partition(self.region_num) {
-                return Err(e);
-            }
+            self.configure_data_partition(self.region_num)?;
         }
 
         if !self.info_configured.get() {
             // If we aren't configured yet, configure now
-            if let Err(e) = self.configure_info_partition(FlashBank::BANK1, self.region_num) {
-                return Err(e);
-            }
+            self.configure_info_partition(FlashBank::BANK1, self.region_num)?;
         }
 
         // Check control status before we commit

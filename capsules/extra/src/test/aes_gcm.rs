@@ -31,7 +31,7 @@ pub struct Test<'a, A: AES128GCM<'a>> {
 impl<'a, A: AES128GCM<'a>> Test<'a, A> {
     pub fn new(aes_gcm: &'a A, buf: &'static mut [u8]) -> Test<'a, A> {
         Test {
-            aes_gcm: aes_gcm,
+            aes_gcm,
             buf: TakeCell::new(buf),
             current_test: Cell::new(0),
             encrypting: Cell::new(true),
@@ -97,7 +97,7 @@ impl<'a, A: AES128GCM<'a>> Test<'a, A> {
             panic!("aes_gcm_test failed: cannot set key.");
         }
 
-        if self.aes_gcm.set_iv(&iv) != Ok(()) {
+        if self.aes_gcm.set_iv(iv) != Ok(()) {
             panic!("aes_gcm_test failed: cannot set IV.");
         }
 

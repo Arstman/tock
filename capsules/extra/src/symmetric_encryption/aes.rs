@@ -55,7 +55,6 @@ pub struct AesDriver<'a, A: AES128<'a> + AES128CCM<'static> + AES128GCM<'static>
 }
 
 impl<
-        'a,
         A: AES128<'static>
             + AES128Ctr
             + AES128CBC
@@ -89,27 +88,21 @@ impl<
     fn run(&self) -> Result<(), ErrorCode> {
         self.processid.map_or(Err(ErrorCode::RESERVE), |processid| {
             self.apps
-                .enter(*processid, |app, kernel_data| {
+                .enter(processid, |app, kernel_data| {
                     self.aes.enable();
-                    let ret = if let Some(op) = &app.aes_operation {
-                        match op {
-                            AesOperation::AES128Ctr(encrypt) => {
-                                self.aes.set_mode_aes128ctr(*encrypt)
-                            }
-                            AesOperation::AES128CBC(encrypt) => {
-                                self.aes.set_mode_aes128cbc(*encrypt)
-                            }
-                            AesOperation::AES128ECB(encrypt) => {
-                                self.aes.set_mode_aes128ecb(*encrypt)
-                            }
-                            AesOperation::AES128CCM(_encrypt) => Ok(()),
-                            AesOperation::AES128GCM(_encrypt) => Ok(()),
+                    match app.aes_operation {
+                        Some(AesOperation::AES128Ctr(encrypt)) => {
+                            self.aes.set_mode_aes128ctr(encrypt)?
                         }
-                    } else {
-                        Err(ErrorCode::INVAL)
-                    };
-                    if ret.is_err() {
-                        return ret;
+                        Some(AesOperation::AES128CBC(encrypt)) => {
+                            self.aes.set_mode_aes128cbc(encrypt)?
+                        }
+                        Some(AesOperation::AES128ECB(encrypt)) => {
+                            self.aes.set_mode_aes128ecb(encrypt)?
+                        }
+                        Some(AesOperation::AES128CCM(_encrypt)) => {}
+                        Some(AesOperation::AES128GCM(_encrypt)) => {}
+                        _ => return Err(ErrorCode::INVAL),
                     }
 
                     kernel_data
@@ -134,21 +127,15 @@ impl<
                                             AesOperation::AES128Ctr(_)
                                             | AesOperation::AES128CBC(_)
                                             | AesOperation::AES128ECB(_) => {
-                                                if let Err(e) = AES128::set_key(self.aes, buf) {
-                                                    return Err(e);
-                                                }
+                                                AES128::set_key(self.aes, buf)?;
                                                 Ok(())
                                             }
                                             AesOperation::AES128CCM(_) => {
-                                                if let Err(e) = AES128CCM::set_key(self.aes, buf) {
-                                                    return Err(e);
-                                                }
+                                                AES128CCM::set_key(self.aes, buf)?;
                                                 Ok(())
                                             }
                                             AesOperation::AES128GCM(_) => {
-                                                if let Err(e) = AES128GCM::set_key(self.aes, buf) {
-                                                    return Err(e);
-                                                }
+                                                AES128GCM::set_key(self.aes, buf)?;
                                                 Ok(())
                                             }
                                         }
@@ -182,25 +169,15 @@ impl<
                                             AesOperation::AES128Ctr(_)
                                             | AesOperation::AES128CBC(_)
                                             | AesOperation::AES128ECB(_) => {
-                                                if let Err(e) = AES128::set_iv(self.aes, buf) {
-                                                    return Err(e);
-                                                }
+                                                AES128::set_iv(self.aes, buf)?;
                                                 Ok(())
                                             }
                                             AesOperation::AES128CCM(_) => {
-                                                if let Err(e) =
-                                                    AES128CCM::set_nonce(self.aes, &buf[0..13])
-                                                {
-                                                    return Err(e);
-                                                }
+                                                AES128CCM::set_nonce(self.aes, &buf[0..13])?;
                                                 Ok(())
                                             }
                                             AesOperation::AES128GCM(_) => {
-                                                if let Err(e) =
-                                                    AES128GCM::set_iv(self.aes, &buf[0..13])
-                                                {
-                                                    return Err(e);
-                                                }
+                                                AES128GCM::set_iv(self.aes, &buf[0..13])?;
                                                 Ok(())
                                             }
                                         }
@@ -290,16 +267,14 @@ impl<
                                         }
                                     }
 
-                                    if let Err(e) = self.calculate_output(
+                                    self.calculate_output(
                                         op,
                                         app.aoff.get(),
                                         app.moff.get(),
                                         app.mlen.get(),
                                         app.mic_len.get(),
                                         app.confidential.get(),
-                                    ) {
-                                        return Err(e);
-                                    }
+                                    )?;
                                     Ok(())
                                 } else {
                                     Err(ErrorCode::FAIL)
@@ -402,7 +377,7 @@ impl<
                 }
 
                 // If this app has a pending command let's use it.
-                app.pending_run_app.take().map_or(false, |processid| {
+                app.pending_run_app.take().is_some_and(|processid| {
                     // Mark this driver as being in use.
                     self.processid.set(processid);
                     // Actually make the buzz happen.
@@ -417,7 +392,6 @@ impl<
 }
 
 impl<
-        'a,
         A: AES128<'static>
             + AES128Ctr
             + AES128CBC
@@ -426,7 +400,7 @@ impl<
             + AES128GCM<'static>,
     > Client<'static> for AesDriver<'static, A>
 {
-    fn crypt_done(&'a self, source: Option<&'static mut [u8]>, destination: &'static mut [u8]) {
+    fn crypt_done(&self, source: Option<&'static mut [u8]>, destination: &'static mut [u8]) {
         if let Some(source_buf) = source {
             self.source_buffer.replace(source_buf);
         }
@@ -434,7 +408,7 @@ impl<
 
         self.processid.map(|id| {
             self.apps
-                .enter(*id, |app, kernel_data| {
+                .enter(id, |app, kernel_data| {
                     let mut data_len = 0;
                     let mut exit = false;
                     let mut static_buffer_len = 0;
@@ -575,7 +549,6 @@ impl<
 }
 
 impl<
-        'a,
         A: AES128<'static>
             + AES128Ctr
             + AES128CBC
@@ -589,7 +562,7 @@ impl<
 
         self.processid.map(|id| {
             self.apps
-                .enter(*id, |_, kernel_data| {
+                .enter(id, |_, kernel_data| {
                     let mut exit = false;
 
                     if let Err(e) = res {
@@ -653,7 +626,6 @@ impl<
 }
 
 impl<
-        'a,
         A: AES128<'static>
             + AES128Ctr
             + AES128CBC
@@ -667,7 +639,7 @@ impl<
 
         self.processid.map(|id| {
             self.apps
-                .enter(*id, |_, kernel_data| {
+                .enter(id, |_, kernel_data| {
                     let mut exit = false;
 
                     if let Err(e) = res {
@@ -731,7 +703,6 @@ impl<
 }
 
 impl<
-        'a,
         A: AES128<'static>
             + AES128Ctr
             + AES128CBC
@@ -756,7 +727,7 @@ impl<
             // we need to verify that that application still exists, and remove
             // it as owner if not.
             if self.active.get() {
-                owning_app == &processid
+                owning_app == processid
             } else {
                 // Check the app still exists.
                 //
@@ -766,7 +737,7 @@ impl<
                 // longer exists and we return `true` to signify the
                 // "or_nonexistant" case.
                 self.apps
-                    .enter(*owning_app, |_, _| owning_app == &processid)
+                    .enter(owning_app, |_, _| owning_app == processid)
                     .unwrap_or(true)
             }
         });
@@ -780,7 +751,7 @@ impl<
             // we need to verify that that application still exists, and remove
             // it as owner if not.
             if self.active.get() {
-                owning_app == &processid
+                owning_app == processid
             } else {
                 // Check the app still exists.
                 //
@@ -790,7 +761,7 @@ impl<
                 // longer exists and we return `true` to signify the
                 // "or_nonexistant" case.
                 self.apps
-                    .enter(*owning_app, |_, _| owning_app == &processid)
+                    .enter(owning_app, |_, _| owning_app == processid)
                     .unwrap_or(true)
             }
         });
@@ -891,16 +862,14 @@ impl<
                                         )?;
 
                                         if let Some(op) = app.aes_operation.as_ref() {
-                                            if let Err(e) = self.calculate_output(
+                                            self.calculate_output(
                                                 op,
                                                 app.aoff.get(),
                                                 app.moff.get(),
                                                 app.mlen.get(),
                                                 app.mic_len.get(),
                                                 app.confidential.get(),
-                                            ) {
-                                                return Err(e);
-                                            }
+                                            )?;
                                             Ok(())
                                         } else {
                                             Err(ErrorCode::FAIL)

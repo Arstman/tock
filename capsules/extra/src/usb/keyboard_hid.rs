@@ -28,7 +28,7 @@ const ENDPOINT_NUM: usize = 1;
 
 const IN_BUFFER: usize = 0;
 
-static LANGUAGES: &'static [u16; 1] = &[
+static LANGUAGES: &[u16; 1] = &[
     0x0409, // English (United States)
 ];
 /// Max packet size specified by spec
@@ -37,8 +37,8 @@ pub const MAX_CTRL_PACKET_SIZE: u8 = 64;
 const N_ENDPOINTS: usize = 1;
 
 /// The HID report descriptor for keyboard from
-/// https://www.usb.org/sites/default/files/hid1_11.pdf
-static REPORT_DESCRIPTOR: &'static [u8] = &[
+/// <https://www.usb.org/sites/default/files/hid1_11.pdf>.
+static REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop),
     0x09, 0x06, // Usage (Keyboard),
     0xA1, 0x01, // Collection (Application),
@@ -81,7 +81,7 @@ static REPORT: ReportDescriptor<'static> = ReportDescriptor {
     desc: REPORT_DESCRIPTOR,
 };
 
-static SUB_HID_DESCRIPTOR: &'static [HIDSubordinateDescriptor] = &[HIDSubordinateDescriptor {
+static SUB_HID_DESCRIPTOR: &[HIDSubordinateDescriptor] = &[HIDSubordinateDescriptor {
     typ: DescriptorType::Report,
     len: REPORT_DESCRIPTOR.len() as u16,
 }];
@@ -134,8 +134,8 @@ impl<'a, U: hil::usb::UsbController<'a>> KeyboardHid<'a, U> {
         let (device_descriptor_buffer, other_descriptor_buffer) =
             descriptors::create_descriptor_buffers(
                 descriptors::DeviceDescriptor {
-                    vendor_id: vendor_id,
-                    product_id: product_id,
+                    vendor_id,
+                    product_id,
                     manufacturer_string: 1,
                     product_string: 2,
                     serial_number_string: 3,
@@ -253,10 +253,6 @@ impl<'a, U: hil::usb::UsbController<'a>> hil::usb::Client<'a> for KeyboardHid<'a
 
     /// Handle the completion of a Control transfer
     fn ctrl_status_complete(&'a self, endpoint: usize) {
-        if self.send_buffer.is_some() {
-            self.controller().endpoint_resume_in(ENDPOINT_NUM);
-        }
-
         self.client_ctrl.ctrl_status_complete(endpoint)
     }
 

@@ -22,19 +22,18 @@
 //!
 //! ### `command` System Call
 //!
-//! The `command` system call support one argument `cmd` which is used to specify the specific
-//! operation, currently the following cmd's are supported:
+//! The `command` system call support one argument `cmd` which is used to
+//! specify the specific operation, currently the following cmd's are supported:
 //!
-//! * `0`: check whether the driver exist
+//! * `0`: check whether the driver exists
 //! * `1`: read the temperature
 //!
 //!
 //! The possible return from the 'command' system call indicates the following:
 //!
 //! * `Ok(())`:    The operation has been successful.
-//! * `BUSY`:      The driver is busy.
-//! * `ENOSUPPORT`: Invalid `cmd`.
-//! * `NOMEM`:     No sufficient memory available.
+//! * `NOSUPPORT`: Invalid `cmd`.
+//! * `NOMEM`:     Insufficient memory available.
 //! * `INVAL`:     Invalid address of the buffer or other error.
 //!
 //! Usage
@@ -42,7 +41,7 @@
 //!
 //! You need a device that provides the `hil::sensors::TemperatureDriver` trait.
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let grant_cap = create_capability!(capabilities::MemoryAllocationCapability);
@@ -57,7 +56,6 @@
 //! ```
 
 use core::cell::Cell;
-use core::convert::TryFrom;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil;
@@ -73,19 +71,19 @@ pub struct App {
     subscribed: bool,
 }
 
-pub struct TemperatureSensor<'a> {
-    driver: &'a dyn hil::sensors::TemperatureDriver<'a>,
+pub struct TemperatureSensor<'a, T: hil::sensors::TemperatureDriver<'a>> {
+    driver: &'a T,
     apps: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
     busy: Cell<bool>,
 }
 
-impl<'a> TemperatureSensor<'a> {
+impl<'a, T: hil::sensors::TemperatureDriver<'a>> TemperatureSensor<'a, T> {
     pub fn new(
-        driver: &'a dyn hil::sensors::TemperatureDriver<'a>,
+        driver: &'a T,
         grant: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
-    ) -> TemperatureSensor<'a> {
+    ) -> TemperatureSensor<'a, T> {
         TemperatureSensor {
-            driver: driver,
+            driver,
             apps: grant,
             busy: Cell::new(false),
         }
@@ -94,31 +92,41 @@ impl<'a> TemperatureSensor<'a> {
     fn enqueue_command(&self, processid: ProcessId) -> CommandReturn {
         self.apps
             .enter(processid, |app, _| {
+                // Unconditionally mark this client as subscribed so it will get
+                // a callback when we get the temperature reading.
+                app.subscribed = true;
+
+                // If we do not already have an ongoing read, start one now.
                 if !self.busy.get() {
-                    app.subscribed = true;
                     self.busy.set(true);
-                    let rcode = self.driver.read_temperature();
-                    let eres = ErrorCode::try_from(rcode);
-                    match eres {
-                        Ok(ecode) => CommandReturn::failure(ecode),
-                        _ => CommandReturn::success(),
+                    match self.driver.read_temperature() {
+                        Ok(()) => CommandReturn::success(),
+                        Err(e) => CommandReturn::failure(e),
                     }
                 } else {
-                    CommandReturn::failure(ErrorCode::BUSY)
+                    // Just return success and we will get the upcall when the
+                    // temperature read is ready.
+                    CommandReturn::success()
                 }
             })
             .unwrap_or_else(|err| CommandReturn::failure(err.into()))
     }
 }
 
-impl hil::sensors::TemperatureClient for TemperatureSensor<'_> {
+impl<'a, T: hil::sensors::TemperatureDriver<'a>> hil::sensors::TemperatureClient
+    for TemperatureSensor<'a, T>
+{
     fn callback(&self, temp_val: Result<i32, ErrorCode>) {
+        // We completed the operation so we clear the busy flag in case we get
+        // another measurement request.
+        self.busy.set(false);
+
+        // Return the temperature reading to any waiting client.
         if let Ok(temp_val) = temp_val {
             // TODO: forward error conditions
             for cntr in self.apps.iter() {
                 cntr.enter(|app, upcalls| {
                     if app.subscribed {
-                        self.busy.set(false);
                         app.subscribed = false;
                         upcalls.schedule_upcall(0, (temp_val as usize, 0, 0)).ok();
                     }
@@ -128,7 +136,7 @@ impl hil::sensors::TemperatureClient for TemperatureSensor<'_> {
     }
 }
 
-impl SyscallDriver for TemperatureSensor<'_> {
+impl<'a, T: hil::sensors::TemperatureDriver<'a>> SyscallDriver for TemperatureSensor<'a, T> {
     fn command(
         &self,
         command_num: usize,
@@ -137,7 +145,7 @@ impl SyscallDriver for TemperatureSensor<'_> {
         processid: ProcessId,
     ) -> CommandReturn {
         match command_num {
-            // check whether the driver exists!!
+            // driver existence check
             0 => CommandReturn::success(),
 
             // read temperature

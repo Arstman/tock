@@ -10,9 +10,11 @@ pub mod priority;
 pub mod round_robin;
 
 use crate::deferred_call::DeferredCall;
-use crate::kernel::StoppedExecutingReason;
 use crate::platform::chip::Chip;
 use crate::process::ProcessId;
+use crate::process::StoppedExecutingReason;
+
+use core::num::NonZeroU32;
 
 /// Trait which any scheduler must implement.
 pub trait Scheduler<C: Chip> {
@@ -91,7 +93,7 @@ pub enum SchedulingDecision {
     /// Tell the kernel to run the specified process with the passed timeslice.
     /// If `None` is passed as a timeslice, the process will be run
     /// cooperatively.
-    RunProcess((ProcessId, Option<u32>)),
+    RunProcess((ProcessId, Option<NonZeroU32>)),
 
     /// Tell the kernel to go to sleep. Notably, if the scheduler asks the
     /// kernel to sleep when kernel tasks are ready, the kernel will not sleep,

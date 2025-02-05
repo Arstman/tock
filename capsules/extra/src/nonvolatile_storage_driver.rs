@@ -40,7 +40,7 @@
 //!
 //! Example instantiation:
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let nonvolatile_storage = static_init!(
@@ -72,8 +72,19 @@ use kernel::{ErrorCode, ProcessId};
 use capsules_core::driver;
 pub const DRIVER_NUM: usize = driver::NUM::NvmStorage as usize;
 
+/// IDs for subscribed upcalls.
+mod upcall {
+    /// Read done callback.
+    pub const READ_DONE: usize = 0;
+    /// Write done callback.
+    pub const WRITE_DONE: usize = 1;
+    /// Number of upcalls.
+    pub const COUNT: u8 = 2;
+}
+
 /// Ids for read-only allow buffers
 mod ro_allow {
+    /// Setup a buffer to write bytes to the nonvolatile storage.
     pub const WRITE: usize = 0;
     /// The number of allow buffers the kernel stores for this grant
     pub const COUNT: u8 = 1;
@@ -81,6 +92,7 @@ mod ro_allow {
 
 /// Ids for read-write allow buffers
 mod rw_allow {
+    /// Setup a buffer to read from the nonvolatile storage into.
     pub const READ: usize = 0;
     /// The number of allow buffers the kernel stores for this grant
     pub const COUNT: u8 = 1;
@@ -126,7 +138,7 @@ pub struct NonvolatileStorage<'a> {
     // Per-app state.
     apps: Grant<
         App,
-        UpcallCount<2>,
+        UpcallCount<{ upcall::COUNT }>,
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
@@ -165,7 +177,7 @@ impl<'a> NonvolatileStorage<'a> {
         driver: &'a dyn hil::nonvolatile_storage::NonvolatileStorage<'a>,
         grant: Grant<
             App,
-            UpcallCount<2>,
+            UpcallCount<{ upcall::COUNT }>,
             AllowRoCount<{ ro_allow::COUNT }>,
             AllowRwCount<{ rw_allow::COUNT }>,
         >,
@@ -176,14 +188,14 @@ impl<'a> NonvolatileStorage<'a> {
         buffer: &'static mut [u8],
     ) -> NonvolatileStorage<'a> {
         NonvolatileStorage {
-            driver: driver,
+            driver,
             apps: grant,
             buffer: TakeCell::new(buffer),
             current_user: OptionalCell::empty(),
-            userspace_start_address: userspace_start_address,
-            userspace_length: userspace_length,
-            kernel_start_address: kernel_start_address,
-            kernel_length: kernel_length,
+            userspace_start_address,
+            userspace_length,
+            kernel_start_address,
+            kernel_length,
             kernel_client: OptionalCell::empty(),
             kernel_pending_command: Cell::new(false),
             kernel_command: Cell::new(NonvolatileCommand::KernelRead),
@@ -260,9 +272,7 @@ impl<'a> NonvolatileStorage<'a> {
                             if self.current_user.is_none() {
                                 // No app is currently using the underlying storage.
                                 // Mark this app as active, and then execute the command.
-                                self.current_user.set(NonvolatileUser::App {
-                                    processid: processid,
-                                });
+                                self.current_user.set(NonvolatileUser::App { processid });
 
                                 // Need to copy bytes if this is a write!
                                 if command == NonvolatileCommand::UserspaceWrite {
@@ -291,7 +301,7 @@ impl<'a> NonvolatileStorage<'a> {
                                 self.userspace_call_driver(command, offset, active_len)
                             } else {
                                 // Some app is using the storage, we must wait.
-                                if app.pending_command == true {
+                                if app.pending_command {
                                     // No more room in the queue, nowhere to store this
                                     // request.
                                     Err(ErrorCode::NOMEM)
@@ -329,7 +339,7 @@ impl<'a> NonvolatileStorage<'a> {
                                 _ => Err(ErrorCode::FAIL),
                             }
                         } else {
-                            if self.kernel_pending_command.get() == true {
+                            if self.kernel_pending_command.get() {
                                 Err(ErrorCode::NOMEM)
                             } else {
                                 self.kernel_pending_command.set(true);
@@ -403,9 +413,7 @@ impl<'a> NonvolatileStorage<'a> {
                 let started_command = cntr.enter(|app, _| {
                     if app.pending_command {
                         app.pending_command = false;
-                        self.current_user.set(NonvolatileUser::App {
-                            processid: processid,
-                        });
+                        self.current_user.set(NonvolatileUser::App { processid });
                         if let Ok(()) =
                             self.userspace_call_driver(app.command, app.offset, app.length)
                         {
@@ -445,7 +453,7 @@ impl hil::nonvolatile_storage::NonvolatileStorageClient for NonvolatileStorage<'
                                 read.mut_enter(|app_buffer| {
                                     let read_len = cmp::min(app_buffer.len(), length);
 
-                                    let d = &app_buffer[0..(read_len as usize)];
+                                    let d = &app_buffer[0..read_len];
                                     for (i, c) in buffer[0..read_len].iter().enumerate() {
                                         d[i].set(*c);
                                     }
@@ -456,7 +464,9 @@ impl hil::nonvolatile_storage::NonvolatileStorageClient for NonvolatileStorage<'
                         self.buffer.replace(buffer);
 
                         // And then signal the app.
-                        kernel_data.schedule_upcall(0, (length, 0, 0)).ok();
+                        kernel_data
+                            .schedule_upcall(upcall::READ_DONE, (length, 0, 0))
+                            .ok();
                     });
                 }
             }
@@ -480,7 +490,9 @@ impl hil::nonvolatile_storage::NonvolatileStorageClient for NonvolatileStorage<'
                         self.buffer.replace(buffer);
 
                         // And then signal the app.
-                        kernel_data.schedule_upcall(1, (length, 0, 0)).ok();
+                        kernel_data
+                            .schedule_upcall(upcall::WRITE_DONE, (length, 0, 0))
+                            .ok();
                     });
                 }
             }
@@ -519,25 +531,6 @@ impl<'a> hil::nonvolatile_storage::NonvolatileStorage<'a> for NonvolatileStorage
 
 /// Provide an interface for userland.
 impl SyscallDriver for NonvolatileStorage<'_> {
-    /// Setup shared kernel-writable buffers.
-    ///
-    /// ### `allow_num`
-    ///
-    /// - `0`: Setup a buffer to read from the nonvolatile storage into.
-
-    /// Setup shared kernel-readable buffers.
-    ///
-    /// ### `allow_num`
-    ///
-    /// - `0`: Setup a buffer to write bytes to the nonvolatile storage.
-
-    // Setup callbacks.
-    //
-    // ### `subscribe_num`
-    //
-    // - `0`: Setup a read done callback.
-    // - `1`: Setup a write done callback.
-
     /// Command interface.
     ///
     /// Commands are selected by the lowest 8 bits of the first argument.
@@ -556,23 +549,22 @@ impl SyscallDriver for NonvolatileStorage<'_> {
         processid: ProcessId,
     ) -> CommandReturn {
         match command_num {
-            0 /* This driver exists. */ => {
-                CommandReturn::success()
-            }
+            0 => CommandReturn::success(),
 
-            1 /* How many bytes are accessible from userspace */ => {
+            1 => {
+                // How many bytes are accessible from userspace
                 // TODO: Would break on 64-bit platforms
                 CommandReturn::success_u32(self.userspace_length as u32)
-            },
+            }
 
-            2 /* Issue a read command */ => {
-                let res =
-                    self.enqueue_command(
-                        NonvolatileCommand::UserspaceRead,
-                        offset,
-                        length,
-                        Some(processid),
-                    );
+            2 => {
+                // Issue a read command
+                let res = self.enqueue_command(
+                    NonvolatileCommand::UserspaceRead,
+                    offset,
+                    length,
+                    Some(processid),
+                );
 
                 match res {
                     Ok(()) => CommandReturn::success(),
@@ -580,14 +572,14 @@ impl SyscallDriver for NonvolatileStorage<'_> {
                 }
             }
 
-            3 /* Issue a write command */ => {
-                let res =
-                    self.enqueue_command(
-                        NonvolatileCommand::UserspaceWrite,
-                        offset,
-                        length,
-                        Some(processid),
-                    );
+            3 => {
+                // Issue a write command
+                let res = self.enqueue_command(
+                    NonvolatileCommand::UserspaceWrite,
+                    offset,
+                    length,
+                    Some(processid),
+                );
 
                 match res {
                     Ok(()) => CommandReturn::success(),

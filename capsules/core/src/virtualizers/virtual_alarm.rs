@@ -89,10 +89,6 @@ impl<'a, A: Alarm<'a>> Time for VirtualMuxAlarm<'a, A> {
 
 impl<'a, A: Alarm<'a>> Alarm<'a> for VirtualMuxAlarm<'a, A> {
     fn set_alarm_client(&self, client: &'a dyn time::AlarmClient) {
-        // Reset the alarm state: should it do this? Does not seem
-        // to be semantically correct. What if you just wanted to
-        // change the callback. Keeping it but skeptical. -pal
-        self.armed.set(false);
         self.client.set(client);
     }
 
@@ -151,7 +147,7 @@ impl<'a, A: Alarm<'a>> Alarm<'a> for VirtualMuxAlarm<'a, A> {
         if enabled == 0 {
             //debug!("virtual_alarm: first alarm: set it.");
             self.mux.set_alarm(reference, dt);
-        } else if self.mux.firing.get() == false {
+        } else if !self.mux.firing.get() {
             // If firing is true, the mux will scan all the alarms after
             // firing and pick the soonest one so do not need to modify the
             // mux. Otherwise, this is an alarm
@@ -221,7 +217,7 @@ impl<'a, A: Alarm<'a>> MuxAlarm<'a, A> {
         MuxAlarm {
             virtual_alarms: List::new(),
             enabled: Cell::new(0),
-            alarm: alarm,
+            alarm,
             firing: Cell::new(false),
             next_tick_vals: Cell::new(None),
         }
@@ -569,13 +565,13 @@ mod tests {
         for v in v_alarms {
             v.setup();
             v.set_alarm_client(&client);
-            let _ = v.set_alarm(now, dt);
+            v.set_alarm(now, dt);
         }
 
         // Set one alarm to trigger immediately (at the hardware delay) and the other alarm to
         // trigger in the future by some large degree
-        let _ = v_alarms[0].set_alarm(now, 0.into());
-        let _ = v_alarms[1].set_alarm(now, 1_000.into());
+        v_alarms[0].set_alarm(now, 0.into());
+        v_alarms[1].set_alarm(now, 1_000.into());
 
         // Run the alarm long enough for every alarm but the longer alarm to fire, and all other
         // alarms should have fired once

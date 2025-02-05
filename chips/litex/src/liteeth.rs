@@ -32,16 +32,6 @@ type LiteEthRXEV<'a, R> = LiteXEventManager<
 type LiteEthTXEV<'a, R> = LiteEthRXEV<'a, R>;
 
 #[repr(C)]
-pub struct LiteEthPhyRegisters<R: LiteXSoCRegisterConfiguration> {
-    /// ETHPHY_CRG_RESET
-    reset: R::WriteOnly8,
-    /// ETHPHY_MDIO_W
-    mdio_w: R::ReadWrite8, //<EthPhyMDIOW>,
-    /// ETHPHY_MDIO_R
-    mdio_r: R::ReadOnly8, //<EthPhyMDIOR>,
-}
-
-#[repr(C)]
 pub struct LiteEthMacRegisters<R: LiteXSoCRegisterConfiguration> {
     /// ETHMAC_SRAM_WRITER_SLOT
     rx_slot: R::ReadOnly8,
@@ -75,11 +65,11 @@ pub struct LiteEthMacRegisters<R: LiteXSoCRegisterConfiguration> {
 }
 
 impl<R: LiteXSoCRegisterConfiguration> LiteEthMacRegisters<R> {
-    fn rx_ev<'a>(&'a self) -> LiteEthRXEV<'a, R> {
+    fn rx_ev(&self) -> LiteEthRXEV<'_, R> {
         LiteEthRXEV::<R>::new(&self.rx_ev_status, &self.rx_ev_pending, &self.rx_ev_enable)
     }
 
-    fn tx_ev<'a>(&'a self) -> LiteEthTXEV<'a, R> {
+    fn tx_ev(&self) -> LiteEthTXEV<'_, R> {
         LiteEthTXEV::<R>::new(&self.tx_ev_status, &self.tx_ev_pending, &self.tx_ev_enable)
     }
 }
@@ -159,7 +149,7 @@ impl<'a, R: LiteXSoCRegisterConfiguration> LiteEth<'a, R> {
         self.initialized.set(true);
     }
 
-    unsafe fn get_slot_buffer<'s>(&'s self, tx: bool, slot_id: usize) -> Option<&'s mut [u8]> {
+    unsafe fn get_slot_buffer(&self, tx: bool, slot_id: usize) -> Option<&mut [u8]> {
         if (tx && slot_id > self.tx_slots) || (!tx && slot_id > self.rx_slots) {
             return None;
         }

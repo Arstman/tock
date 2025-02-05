@@ -661,7 +661,7 @@ impl<'a> DmaChannel<'a> {
     pub fn new(chan_nr: usize) -> DmaChannel<'a> {
         DmaChannel {
             registers: DMA_BASE,
-            chan_nr: chan_nr,
+            chan_nr,
             in_use: Cell::new(false),
             config: Cell::new(DmaConfig::const_default()),
             transfer_type: Cell::new(DmaTransferType::None),
@@ -687,7 +687,7 @@ impl<'a> DmaChannel<'a> {
 
         // Set the pointer to the configuration-memory
         // Since the config needs exactly 256 bytes, mask out the lower 256 bytes
-        let addr = (&DMA_CONFIG.0[0] as *const DmaChannelControl as u32) & (!0xFFu32);
+        let addr = (core::ptr::from_ref::<DmaChannelControl>(&DMA_CONFIG.0[0]) as u32) & (!0xFFu32);
         self.registers.ctlbase.set(addr);
     }
 
@@ -792,13 +792,13 @@ impl<'a> DmaChannel<'a> {
             0
         };
 
+        // Set the DMA mode since the DMA module sets it back to stop after every cycle
+        // Set the DMA cycles to the amount of remaining words
+        // Set the number of DMA-transfers after the DMA has to rearbitrate the bus
         DMA_CONFIG.0[chan_nr].ctrl.modify(
-            // Set the DMA mode since the DMA module sets it back to stop after every cycle
             DMA_CTRL::CYCLE_CTRL.val(conf.mode as u32)
-            // Set the DMA cycles to the amount of remaining words
-            + DMA_CTRL::N_MINUS_1.val(((rem_words - 1) % MAX_TRANSFERS_LEN) as u32)
-            // Set the number of DMA-transfers after the DMA has to rearbitrate the bus
-            + DMA_CTRL::R_POWER.val(r_power),
+                + DMA_CTRL::N_MINUS_1.val(((rem_words - 1) % MAX_TRANSFERS_LEN) as u32)
+                + DMA_CTRL::R_POWER.val(r_power),
         );
     }
 
@@ -816,13 +816,13 @@ impl<'a> DmaChannel<'a> {
     fn configure_channel(&self, bytes_to_transmit: usize, chan_nr: usize) {
         let conf = self.config.get();
         let transfers = bytes_to_transmit >> (conf.width as usize);
+        // The DMA can only transmit 1024 words with 1 transfer
+        // Reset the bits in case they were set before to a different value
+        // Set the DMA mode since it the DMA module sets it back to to stop after every cycle
         DMA_CONFIG.0[chan_nr].ctrl.modify(
-            // The DMA can only transmit 1024 words with 1 transfer
             DMA_CTRL::N_MINUS_1.val(((transfers - 1) % MAX_TRANSFERS_LEN) as u32)
-            // Reset the bits in case they were set before to a different value
-            + DMA_CTRL::R_POWER.val(0)
-            // Set the DMA mode since it the DMA module sets it back to to stop after every cycle
-            + DMA_CTRL::CYCLE_CTRL.val(conf.mode as u32),
+                + DMA_CTRL::R_POWER.val(0)
+                + DMA_CTRL::CYCLE_CTRL.val(conf.mode as u32),
         );
     }
 
@@ -940,8 +940,8 @@ impl<'a> DmaChannel<'a> {
 
         // The pointers must point to the end of the buffer, for detailed calculation see
         // datasheet p. 646, section 11.2.4.4.
-        let src_end_ptr = (&src_buf[0] as *const u8 as u32) + ((len as u32) - 1);
-        let dst_end_ptr = (&dst_buf[0] as *const u8 as u32) + ((len as u32) - 1);
+        let src_end_ptr = (core::ptr::from_ref::<u8>(&src_buf[0]) as u32) + ((len as u32) - 1);
+        let dst_end_ptr = (core::ptr::from_ref::<u8>(&dst_buf[0]) as u32) + ((len as u32) - 1);
 
         // Setup the DMA configuration
         self.set_dma_mode(DmaMode::Basic);
@@ -981,7 +981,7 @@ impl<'a> DmaChannel<'a> {
         // The pointers must point to the end of the buffer, for detailed calculation see
         // datasheet p. 646, section 11.2.4.4.
         let src_end_ptr = src_reg as u32;
-        let dst_end_ptr = (&buf[0] as *const u8 as u32) + ((len as u32) - 1);
+        let dst_end_ptr = (core::ptr::from_ref::<u8>(&buf[0]) as u32) + ((len as u32) - 1);
 
         // Setup the DMA configuration
         self.set_dma_mode(DmaMode::Basic);
@@ -1004,7 +1004,7 @@ impl<'a> DmaChannel<'a> {
     pub fn transfer_mem_to_periph(&self, dst_reg: *const (), buf: &'static mut [u8], len: usize) {
         // The pointers must point to the end of the buffer, for detailed calculation see
         // datasheet p. 646, section 11.2.4.4.
-        let src_end_ptr = (&buf[0] as *const u8 as u32) + ((len as u32) - 1);
+        let src_end_ptr = (core::ptr::from_ref::<u8>(&buf[0]) as u32) + ((len as u32) - 1);
         let dst_end_ptr = dst_reg as u32;
 
         // Setup the DMA configuration
@@ -1037,8 +1037,8 @@ impl<'a> DmaChannel<'a> {
         // datasheet p. 646, section 11.2.4.4.
 
         let src_end_ptr = src_reg as u32;
-        let dst_end_ptr1 = (&buf1[0] as *const u8 as u32) + ((len1 as u32) - 1);
-        let dst_end_ptr2 = (&buf2[0] as *const u8 as u32) + ((len2 as u32) - 1);
+        let dst_end_ptr1 = (core::ptr::from_ref::<u8>(&buf1[0]) as u32) + ((len1 as u32) - 1);
+        let dst_end_ptr2 = (core::ptr::from_ref::<u8>(&buf2[0]) as u32) + ((len2 as u32) - 1);
 
         // Setup the DMA configuration
         self.set_dma_mode(DmaMode::PingPong);
@@ -1063,7 +1063,7 @@ impl<'a> DmaChannel<'a> {
 
     /// Provide a new buffer for a ping-pong transfer
     pub fn provide_new_buffer(&self, buf: &'static mut [u8], len: usize) {
-        let buf_end_ptr = (&buf[0] as *const u8 as u32) + ((len as u32) - 1);
+        let buf_end_ptr = (core::ptr::from_ref::<u8>(&buf[0]) as u32) + ((len as u32) - 1);
 
         if self.transfer_type.get() == DmaTransferType::PeripheralToMemoryPingPong {
             if self.active_buf.get() == ActiveBuffer::Primary {

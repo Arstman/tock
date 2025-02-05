@@ -3,27 +3,27 @@
 // Copyright Tock Contributors 2022.
 
 use core::fmt::Write;
-use cortexm4::{self, nvic, CortexM4, CortexMVariant};
-use kernel::hil::time::Alarm;
+use cortexm4f::{nvic, CortexM4F, CortexMVariant};
 use kernel::platform::chip::InterruptService;
 
 pub struct NRF52<'a, I: InterruptService + 'a> {
-    mpu: cortexm4::mpu::MPU,
-    userspace_kernel_boundary: cortexm4::syscall::SysCall,
+    mpu: cortexm4f::mpu::MPU,
+    userspace_kernel_boundary: cortexm4f::syscall::SysCall,
     interrupt_service: &'a I,
 }
 
 impl<'a, I: InterruptService + 'a> NRF52<'a, I> {
     pub unsafe fn new(interrupt_service: &'a I) -> Self {
         Self {
-            mpu: cortexm4::mpu::MPU::new(),
-            userspace_kernel_boundary: cortexm4::syscall::SysCall::new(),
+            mpu: cortexm4f::mpu::MPU::new(),
+            userspace_kernel_boundary: cortexm4f::syscall::SysCall::new(),
             interrupt_service,
         }
     }
 }
 
-/// This struct, when initialized, instantiates all peripheral drivers for the apollo3.
+/// This struct, when initialized, instantiates all peripheral drivers for the nrf52.
+///
 /// If a board wishes to use only a subset of these peripherals, this
 /// should not be used or imported, and a modified version should be
 /// constructed manually in main.rs.
@@ -31,7 +31,6 @@ pub struct Nrf52DefaultPeripherals<'a> {
     pub acomp: crate::acomp::Comparator<'a>,
     pub ecb: crate::aes::AesECB<'a>,
     pub pwr_clk: crate::power::Power<'a>,
-    pub ieee802154_radio: crate::ieee802154_radio::Radio<'a>,
     pub ble_radio: crate::ble_radio::Radio<'a>,
     pub trng: crate::trng::Trng<'a>,
     pub rtc: crate::rtc::Rtc<'a>,
@@ -41,8 +40,6 @@ pub struct Nrf52DefaultPeripherals<'a> {
     pub timer2: crate::timer::Timer,
     pub uarte0: crate::uart::Uarte<'a>,
     pub spim0: crate::spi::SPIM<'a>,
-    pub twi0: crate::i2c::TWI<'a>,
-    pub spim1: crate::spi::SPIM<'a>,
     pub twi1: crate::i2c::TWI<'a>,
     pub spim2: crate::spi::SPIM<'a>,
     pub adc: crate::adc::Adc<'a>,
@@ -51,13 +48,12 @@ pub struct Nrf52DefaultPeripherals<'a> {
     pub pwm0: crate::pwm::Pwm,
 }
 
-impl<'a> Nrf52DefaultPeripherals<'a> {
+impl Nrf52DefaultPeripherals<'_> {
     pub fn new() -> Self {
         Self {
             acomp: crate::acomp::Comparator::new(),
             ecb: crate::aes::AesECB::new(),
             pwr_clk: crate::power::Power::new(),
-            ieee802154_radio: crate::ieee802154_radio::Radio::new(),
             ble_radio: crate::ble_radio::Radio::new(),
             trng: crate::trng::Trng::new(),
             rtc: crate::rtc::Rtc::new(),
@@ -65,13 +61,12 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
             timer0: crate::timer::TimerAlarm::new(0),
             timer1: crate::timer::TimerAlarm::new(1),
             timer2: crate::timer::Timer::new(2),
-            uarte0: crate::uart::Uarte::new(),
+            uarte0: crate::uart::Uarte::new(crate::uart::UARTE0_BASE),
             spim0: crate::spi::SPIM::new(0),
-            twi0: crate::i2c::TWI::new_twi0(),
-            spim1: crate::spi::SPIM::new(1),
             twi1: crate::i2c::TWI::new_twi1(),
             spim2: crate::spi::SPIM::new(2),
-            adc: crate::adc::Adc::new(),
+            // Default to 3.3 V VDD reference.
+            adc: crate::adc::Adc::new(3300),
             nvmc: crate::nvmc::Nvmc::new(),
             clock: crate::clock::Clock::new(),
             pwm0: crate::pwm::Pwm::new(),
@@ -79,30 +74,19 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
     }
     // Necessary for setting up circular dependencies
     pub fn init(&'static self) {
-        self.ieee802154_radio.set_timer_ref(&self.timer0);
-        self.timer0.set_alarm_client(&self.ieee802154_radio);
         kernel::deferred_call::DeferredCallClient::register(&self.nvmc);
     }
 }
-impl<'a> kernel::platform::chip::InterruptService for Nrf52DefaultPeripherals<'a> {
+impl kernel::platform::chip::InterruptService for Nrf52DefaultPeripherals<'_> {
     unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
         match interrupt {
             crate::peripheral_interrupts::COMP => self.acomp.handle_interrupt(),
             crate::peripheral_interrupts::ECB => self.ecb.handle_interrupt(),
             crate::peripheral_interrupts::POWER_CLOCK => self.pwr_clk.handle_interrupt(),
-            crate::peripheral_interrupts::RADIO => {
-                match (
-                    self.ieee802154_radio.is_enabled(),
-                    self.ble_radio.is_enabled(),
-                ) {
-                    (false, false) => (),
-                    (true, false) => self.ieee802154_radio.handle_interrupt(),
-                    (false, true) => self.ble_radio.handle_interrupt(),
-                    (true, true) => kernel::debug!(
-                        "nRF 802.15.4 and BLE radios cannot be simultaneously enabled!"
-                    ),
-                }
-            }
+            crate::peripheral_interrupts::RADIO => match self.ble_radio.is_enabled() {
+                false => (),
+                true => self.ble_radio.handle_interrupt(),
+            },
             crate::peripheral_interrupts::RNG => self.trng.handle_interrupt(),
             crate::peripheral_interrupts::RTC1 => self.rtc.handle_interrupt(),
             crate::peripheral_interrupts::TEMP => self.temp.handle_interrupt(),
@@ -110,34 +94,8 @@ impl<'a> kernel::platform::chip::InterruptService for Nrf52DefaultPeripherals<'a
             crate::peripheral_interrupts::TIMER1 => self.timer1.handle_interrupt(),
             crate::peripheral_interrupts::TIMER2 => self.timer2.handle_interrupt(),
             crate::peripheral_interrupts::UART0 => self.uarte0.handle_interrupt(),
-            crate::peripheral_interrupts::SPI0_TWI0 => {
-                // SPI0 and TWI0 share interrupts.
-                // Dispatch the correct handler.
-                match (self.spim0.is_enabled(), self.twi0.is_enabled()) {
-                    (false, false) => (),
-                    (true, false) => self.spim0.handle_interrupt(),
-                    (false, true) => self.twi0.handle_interrupt(),
-                    (true, true) => debug_assert!(
-                        false,
-                        "SPIM0 and TWIM0 cannot be \
-                         enabled at the same time."
-                    ),
-                }
-            }
-            crate::peripheral_interrupts::SPI1_TWI1 => {
-                // SPI1 and TWI1 share interrupts.
-                // Dispatch the correct handler.
-                match (self.spim1.is_enabled(), self.twi1.is_enabled()) {
-                    (false, false) => (),
-                    (true, false) => self.spim1.handle_interrupt(),
-                    (false, true) => self.twi1.handle_interrupt(),
-                    (true, true) => debug_assert!(
-                        false,
-                        "SPIM1 and TWIM1 cannot be \
-                         enabled at the same time."
-                    ),
-                }
-            }
+            crate::peripheral_interrupts::SPI0_TWI0 => self.spim0.handle_interrupt(),
+            crate::peripheral_interrupts::SPI1_TWI1 => self.twi1.handle_interrupt(),
             crate::peripheral_interrupts::SPIM2_SPIS2_SPI2 => self.spim2.handle_interrupt(),
             crate::peripheral_interrupts::ADC => self.adc.handle_interrupt(),
             _ => return false,
@@ -147,8 +105,8 @@ impl<'a> kernel::platform::chip::InterruptService for Nrf52DefaultPeripherals<'a
 }
 
 impl<'a, I: InterruptService + 'a> kernel::platform::chip::Chip for NRF52<'a, I> {
-    type MPU = cortexm4::mpu::MPU;
-    type UserspaceKernelBoundary = cortexm4::syscall::SysCall;
+    type MPU = cortexm4f::mpu::MPU;
+    type UserspaceKernelBoundary = cortexm4f::syscall::SysCall;
 
     fn mpu(&self) -> &Self::MPU {
         &self.mpu
@@ -181,7 +139,7 @@ impl<'a, I: InterruptService + 'a> kernel::platform::chip::Chip for NRF52<'a, I>
 
     fn sleep(&self) {
         unsafe {
-            cortexm4::support::wfi();
+            cortexm4f::support::wfi();
         }
     }
 
@@ -189,10 +147,10 @@ impl<'a, I: InterruptService + 'a> kernel::platform::chip::Chip for NRF52<'a, I>
     where
         F: FnOnce() -> R,
     {
-        cortexm4::support::atomic(f)
+        cortexm4f::support::atomic(f)
     }
 
     unsafe fn print_state(&self, write: &mut dyn Write) {
-        CortexM4::print_cortexm_state(write);
+        CortexM4F::print_cortexm_state(write);
     }
 }

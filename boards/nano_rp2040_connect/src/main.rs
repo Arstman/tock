@@ -11,9 +11,8 @@
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
-#![feature(naked_functions)]
 
-use core::arch::asm;
+use core::ptr::{addr_of, addr_of_mut};
 
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
 use components::gpio::GpioComponent;
@@ -27,7 +26,6 @@ use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::scheduler::round_robin::RoundRobinSched;
 use kernel::syscall::SyscallDriver;
 use kernel::{capabilities, create_capability, static_init, Kernel};
-use rp2040;
 use rp2040::adc::{Adc, Channel};
 use rp2040::chip::{Rp2040, Rp2040DefaultPeripherals};
 use rp2040::clocks::{
@@ -49,16 +47,6 @@ mod flash_bootloader;
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x1500] = [0; 0x1500];
 
-// Function for the process console to reboot the Nano RP2040 Connect.
-fn reset_function() -> ! {
-    unsafe {
-        cortexm0p::scb::reset();
-    }
-    loop {
-        cortexm0p::support::nop();
-    }
-}
-
 // Manually setting the boot header section that contains the FCB header
 #[used]
 #[link_section = ".flash_bootloader"]
@@ -66,7 +54,8 @@ static FLASH_BOOTLOADER: [u8; 256] = flash_bootloader::FLASH_BOOTLOADER;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
-const FAULT_RESPONSE: kernel::process::PanicFaultPolicy = kernel::process::PanicFaultPolicy {};
+const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
+    capsules_system::process_policies::PanicFaultPolicy {};
 
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
@@ -75,7 +64,13 @@ static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS]
     [None; NUM_PROCS];
 
 static mut CHIP: Option<&'static Rp2040<Rp2040DefaultPeripherals>> = None;
-static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
+static mut PROCESS_PRINTER: Option<&'static capsules_system::process_printer::ProcessPrinterText> =
+    None;
+
+type TemperatureRp2040Sensor = components::temperature_rp2040::TemperatureRp2040ComponentType<
+    capsules_core::virtualizers::virtual_adc::AdcDevice<'static, rp2040::adc::Adc<'static>>,
+>;
+type TemperatureDriver = components::temperature::TemperatureComponentType<TemperatureRp2040Sensor>;
 
 /// Supported drivers by the platform
 pub struct NanoRP2040Connect {
@@ -88,7 +83,7 @@ pub struct NanoRP2040Connect {
     gpio: &'static capsules_core::gpio::GPIO<'static, RPGpioPin<'static>>,
     led: &'static capsules_core::led::LedDriver<'static, LedHigh<'static, RPGpioPin<'static>>, 1>,
     adc: &'static capsules_core::adc::AdcVirtualized<'static>,
-    temperature: &'static capsules_extra::temperature::TemperatureSensor<'static>,
+    temperature: &'static TemperatureDriver,
     ninedof: &'static capsules_extra::ninedof::NineDof<'static>,
     lsm6dsoxtr: &'static capsules_extra::lsm6dsoxtr::Lsm6dsoxtrI2C<
         'static,
@@ -126,22 +121,18 @@ impl KernelResources<Rp2040<'static, Rp2040DefaultPeripherals<'static>>> for Nan
     type SyscallDriverLookup = Self;
     type SyscallFilter = ();
     type ProcessFault = ();
-    type CredentialsCheckingPolicy = ();
     type Scheduler = RoundRobinSched<'static>;
     type SchedulerTimer = cortexm0p::systick::SysTick;
     type WatchDog = ();
     type ContextSwitchCallback = ();
 
     fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
-        &self
+        self
     }
     fn syscall_filter(&self) -> &Self::SyscallFilter {
         &()
     }
     fn process_fault(&self) -> &Self::ProcessFault {
-        &()
-    }
-    fn credentials_checking_policy(&self) -> &'static Self::CredentialsCheckingPolicy {
         &()
     }
     fn scheduler(&self) -> &Self::Scheduler {
@@ -158,31 +149,36 @@ impl KernelResources<Rp2040<'static, Rp2040DefaultPeripherals<'static>>> for Nan
     }
 }
 
-/// Entry point used for debuger
-///
-/// When loaded using gdb, the Arduino Nano RP2040 Connect is not reset
-/// by default. Without this function, gdb sets the PC to the
-/// beginning of the flash. This is not correct, as the RP2040
-/// has a more complex boot process.
-///
-/// This function is set to be the entry point for gdb and is used
-/// to send the RP2040 back in the bootloader so that all the boot
-/// sqeuence is performed.
-#[no_mangle]
-#[naked]
-pub unsafe extern "C" fn jump_to_bootloader() {
-    asm!(
-        "
+#[allow(dead_code)]
+extern "C" {
+    /// Entry point used for debugger
+    ///
+    /// When loaded using gdb, the Arduino Nano RP2040 Connect is not reset
+    /// by default. Without this function, gdb sets the PC to the
+    /// beginning of the flash. This is not correct, as the RP2040
+    /// has a more complex boot process.
+    ///
+    /// This function is set to be the entry point for gdb and is used
+    /// to send the RP2040 back in the bootloader so that all the boot
+    /// sequence is performed.
+    fn jump_to_bootloader();
+}
+
+#[cfg(any(doc, all(target_arch = "arm", target_os = "none")))]
+core::arch::global_asm!(
+    "
+    .section .jump_to_bootloader, \"ax\"
+    .global jump_to_bootloader
+    .thumb_func
+  jump_to_bootloader:
     movs r0, #0
     ldr r1, =(0xe0000000 + 0x0000ed08)
     str r0, [r1]
     ldmia r0!, {{r1, r2}}
     msr msp, r1
     bx r2
-    ",
-        options(noreturn)
-    );
-}
+    "
+);
 
 fn init_clocks(peripherals: &Rp2040DefaultPeripherals) {
     // Start tick in watchdog
@@ -257,17 +253,15 @@ fn init_clocks(peripherals: &Rp2040DefaultPeripherals) {
 /// removed when this function returns. Otherwise, the stack space used for
 /// these static_inits is wasted.
 #[inline(never)]
-unsafe fn create_peripherals() -> &'static mut Rp2040DefaultPeripherals<'static> {
-    static_init!(Rp2040DefaultPeripherals, Rp2040DefaultPeripherals::new())
-}
-
-/// Main function called after RAM initialized.
-#[no_mangle]
-pub unsafe fn main() {
+pub unsafe fn start() -> (
+    &'static kernel::Kernel,
+    NanoRP2040Connect,
+    &'static rp2040::chip::Rp2040<'static, Rp2040DefaultPeripherals<'static>>,
+) {
     // Loads relocations and clears BSS
     rp2040::init();
 
-    let peripherals = create_peripherals();
+    let peripherals = static_init!(Rp2040DefaultPeripherals, Rp2040DefaultPeripherals::new());
     peripherals.resolve_dependencies();
 
     // Reset all peripherals except QSPI (we might be booting from Flash), PLL USB and PLL SYS
@@ -293,13 +287,13 @@ pub unsafe fn main() {
         true,
     );
 
-    init_clocks(&peripherals);
+    init_clocks(peripherals);
 
     // Unreset all peripherals
     peripherals.resets.unreset_all_except(&[], true);
 
     // Set the UART used for panic
-    io::WRITER.set_uart(&peripherals.uart0);
+    (*addr_of_mut!(io::WRITER)).set_uart(&peripherals.uart0);
 
     //set RX and TX pins in UART mode
     let gpio_tx = peripherals.pins.get_pin(RPGpio::GPIO0);
@@ -322,11 +316,10 @@ pub unsafe fn main() {
 
     CHIP = Some(chip);
 
-    let board_kernel = static_init!(Kernel, Kernel::new(&PROCESSES));
+    let board_kernel = static_init!(Kernel, Kernel::new(&*addr_of!(PROCESSES)));
 
     let process_management_capability =
         create_capability!(capabilities::ProcessManagementCapability);
-    let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
     let memory_allocation_capability = create_capability!(capabilities::MemoryAllocationCapability);
 
     let mux_alarm = components::alarm::AlarmMuxComponent::new(&peripherals.timer)
@@ -396,46 +389,46 @@ pub unsafe fn main() {
         components::gpio_component_helper!(
             RPGpioPin,
             // Used for serial communication. Comment them in if you don't use serial.
-            // 0 => &peripherals.pins.get_pin(RPGpio::GPIO0),
-            // 1 => &peripherals.pins.get_pin(RPGpio::GPIO1),
-            2 => &peripherals.pins.get_pin(RPGpio::GPIO2),
-            3 => &peripherals.pins.get_pin(RPGpio::GPIO3),
-            // 4 => &peripherals.pins.get_pin(RPGpio::GPIO4),
-            5 => &peripherals.pins.get_pin(RPGpio::GPIO5),
-            // 6 => &peripherals.pins.get_pin(RPGpio::GPIO6),
-            // 7 => &peripherals.pins.get_pin(RPGpio::GPIO7),
-            8 => &peripherals.pins.get_pin(RPGpio::GPIO8),
-            9 => &peripherals.pins.get_pin(RPGpio::GPIO9),
-            10 => &peripherals.pins.get_pin(RPGpio::GPIO10),
-            11 => &peripherals.pins.get_pin(RPGpio::GPIO11),
-            // 12 => &peripherals.pins.get_pin(RPGpio::GPIO12),
-            // 13 => &peripherals.pins.get_pin(RPGpio::GPIO13),
-            14 => &peripherals.pins.get_pin(RPGpio::GPIO14),
-            15 => &peripherals.pins.get_pin(RPGpio::GPIO15),
-            16 => &peripherals.pins.get_pin(RPGpio::GPIO16),
-            17 => &peripherals.pins.get_pin(RPGpio::GPIO17),
-            18 => &peripherals.pins.get_pin(RPGpio::GPIO18),
-            19 => &peripherals.pins.get_pin(RPGpio::GPIO19),
-            20 => &peripherals.pins.get_pin(RPGpio::GPIO20),
-            21 => &peripherals.pins.get_pin(RPGpio::GPIO21),
-            22 => &peripherals.pins.get_pin(RPGpio::GPIO22),
-            23 => &peripherals.pins.get_pin(RPGpio::GPIO23),
-            24 => &peripherals.pins.get_pin(RPGpio::GPIO24),
+            // 0 => peripherals.pins.get_pin(RPGpio::GPIO0),
+            // 1 => peripherals.pins.get_pin(RPGpio::GPIO1),
+            2 => peripherals.pins.get_pin(RPGpio::GPIO2),
+            3 => peripherals.pins.get_pin(RPGpio::GPIO3),
+            // 4 => peripherals.pins.get_pin(RPGpio::GPIO4),
+            5 => peripherals.pins.get_pin(RPGpio::GPIO5),
+            // 6 => peripherals.pins.get_pin(RPGpio::GPIO6),
+            // 7 => peripherals.pins.get_pin(RPGpio::GPIO7),
+            8 => peripherals.pins.get_pin(RPGpio::GPIO8),
+            9 => peripherals.pins.get_pin(RPGpio::GPIO9),
+            10 => peripherals.pins.get_pin(RPGpio::GPIO10),
+            11 => peripherals.pins.get_pin(RPGpio::GPIO11),
+            // 12 => peripherals.pins.get_pin(RPGpio::GPIO12),
+            // 13 => peripherals.pins.get_pin(RPGpio::GPIO13),
+            14 => peripherals.pins.get_pin(RPGpio::GPIO14),
+            15 => peripherals.pins.get_pin(RPGpio::GPIO15),
+            16 => peripherals.pins.get_pin(RPGpio::GPIO16),
+            17 => peripherals.pins.get_pin(RPGpio::GPIO17),
+            18 => peripherals.pins.get_pin(RPGpio::GPIO18),
+            19 => peripherals.pins.get_pin(RPGpio::GPIO19),
+            20 => peripherals.pins.get_pin(RPGpio::GPIO20),
+            21 => peripherals.pins.get_pin(RPGpio::GPIO21),
+            22 => peripherals.pins.get_pin(RPGpio::GPIO22),
+            23 => peripherals.pins.get_pin(RPGpio::GPIO23),
+            24 => peripherals.pins.get_pin(RPGpio::GPIO24),
             // LED pin
-            // 25 => &peripherals.pins.get_pin(RPGpio::GPIO25),
+            // 25 => peripherals.pins.get_pin(RPGpio::GPIO25),
 
             // Uncomment to use these as GPIO pins instead of ADC pins
-            // 26 => &peripherals.pins.get_pin(RPGpio::GPIO26),
-            // 27 => &peripherals.pins.get_pin(RPGpio::GPIO27),
-            // 28 => &peripherals.pins.get_pin(RPGpio::GPIO28),
-            // 29 => &peripherals.pins.get_pin(RPGpio::GPIO29)
+            // 26 => peripherals.pins.get_pin(RPGpio::GPIO26),
+            // 27 => peripherals.pins.get_pin(RPGpio::GPIO27),
+            // 28 => peripherals.pins.get_pin(RPGpio::GPIO28),
+            // 29 => peripherals.pins.get_pin(RPGpio::GPIO29)
         ),
     )
     .finalize(components::gpio_component_static!(RPGpioPin<'static>));
 
     let led = LedsComponent::new().finalize(components::led_component_static!(
         LedHigh<'static, RPGpioPin<'static>>,
-        LedHigh::new(&peripherals.pins.get_pin(RPGpio::GPIO6))
+        LedHigh::new(peripherals.pins.get_pin(RPGpio::GPIO6))
     ));
 
     peripherals.adc.init();
@@ -479,14 +472,14 @@ pub unsafe fn main() {
     )
     .finalize(components::ninedof_component_static!(lsm6dsoxtr));
 
-    let grant_cap = create_capability!(capabilities::MemoryAllocationCapability);
-    let grant_temperature =
-        board_kernel.create_grant(capsules_extra::temperature::DRIVER_NUM, &grant_cap);
-
-    let temp = static_init!(
-        capsules_extra::temperature::TemperatureSensor<'static>,
-        capsules_extra::temperature::TemperatureSensor::new(temp_sensor, grant_temperature)
-    );
+    let temp = components::temperature::TemperatureComponent::new(
+        board_kernel,
+        capsules_extra::temperature::DRIVER_NUM,
+        temp_sensor,
+    )
+    .finalize(components::temperature_component_static!(
+        TemperatureRp2040Sensor
+    ));
 
     let _ = lsm6dsoxtr
         .configure(
@@ -514,16 +507,16 @@ pub unsafe fn main() {
 
     kernel::hil::sensors::TemperatureDriver::set_client(temp_sensor, temp);
 
-    let adc_channel_0 = components::adc::AdcComponent::new(&adc_mux, Channel::Channel0)
+    let adc_channel_0 = components::adc::AdcComponent::new(adc_mux, Channel::Channel0)
         .finalize(components::adc_component_static!(Adc));
 
-    let adc_channel_1 = components::adc::AdcComponent::new(&adc_mux, Channel::Channel1)
+    let adc_channel_1 = components::adc::AdcComponent::new(adc_mux, Channel::Channel1)
         .finalize(components::adc_component_static!(Adc));
 
-    let adc_channel_2 = components::adc::AdcComponent::new(&adc_mux, Channel::Channel2)
+    let adc_channel_2 = components::adc::AdcComponent::new(adc_mux, Channel::Channel2)
         .finalize(components::adc_component_static!(Adc));
 
-    let adc_channel_3 = components::adc::AdcComponent::new(&adc_mux, Channel::Channel3)
+    let adc_channel_3 = components::adc::AdcComponent::new(adc_mux, Channel::Channel3)
         .finalize(components::adc_component_static!(Adc));
 
     let adc_syscall =
@@ -545,12 +538,12 @@ pub unsafe fn main() {
         uart_mux,
         mux_alarm,
         process_printer,
-        Some(reset_function),
+        Some(cortexm0p::support::reset),
     )
     .finalize(components::process_console_component_static!(RPTimer));
     let _ = process_console.start();
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
+    let scheduler = components::sched::round_robin::RoundRobinComponent::new(&*addr_of!(PROCESSES))
         .finalize(components::round_robin_component_static!(NUM_PROCS));
 
     let nano_rp2040_connect = NanoRP2040Connect {
@@ -559,15 +552,15 @@ pub unsafe fn main() {
             kernel::ipc::DRIVER_NUM,
             &memory_allocation_capability,
         ),
-        alarm: alarm,
-        gpio: gpio,
-        led: led,
-        console: console,
+        alarm,
+        gpio,
+        led,
+        console,
         adc: adc_syscall,
         temperature: temp,
 
-        lsm6dsoxtr: lsm6dsoxtr,
-        ninedof: ninedof,
+        lsm6dsoxtr,
+        ninedof,
 
         scheduler,
         systick: cortexm0p::systick::SysTick::new_with_calibration(125_000_000),
@@ -601,14 +594,14 @@ pub unsafe fn main() {
         board_kernel,
         chip,
         core::slice::from_raw_parts(
-            &_sapps as *const u8,
-            &_eapps as *const u8 as usize - &_sapps as *const u8 as usize,
+            core::ptr::addr_of!(_sapps),
+            core::ptr::addr_of!(_eapps) as usize - core::ptr::addr_of!(_sapps) as usize,
         ),
         core::slice::from_raw_parts_mut(
-            &mut _sappmem as *mut u8,
-            &_eappmem as *const u8 as usize - &_sappmem as *const u8 as usize,
+            core::ptr::addr_of_mut!(_sappmem),
+            core::ptr::addr_of!(_eappmem) as usize - core::ptr::addr_of!(_sappmem) as usize,
         ),
-        &mut PROCESSES,
+        &mut *addr_of_mut!(PROCESSES),
         &FAULT_RESPONSE,
         &process_management_capability,
     )
@@ -617,10 +610,14 @@ pub unsafe fn main() {
         debug!("{:?}", err);
     });
 
-    board_kernel.kernel_loop(
-        &nano_rp2040_connect,
-        chip,
-        Some(&nano_rp2040_connect.ipc),
-        &main_loop_capability,
-    );
+    (board_kernel, nano_rp2040_connect, chip)
+}
+
+/// Main function called after RAM initialized.
+#[no_mangle]
+pub unsafe fn main() {
+    let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
+
+    let (board_kernel, platform, chip) = start();
+    board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }

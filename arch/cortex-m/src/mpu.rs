@@ -8,15 +8,18 @@
 use core::cell::Cell;
 use core::cmp;
 use core::fmt;
+use core::num::NonZeroUsize;
 
-use kernel;
 use kernel::platform::mpu;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::math;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, FieldValue, ReadOnly, ReadWrite};
 use kernel::utilities::StaticRef;
-use kernel::ProcessId;
+
+/// Smallest allowable MPU region across all CortexM cores
+/// Individual cores may have bigger min sizes, but never lower than 32
+const CORTEXM_MIN_REGION_SIZE: usize = 32;
 
 /// MPU Registers for the Cortex-M3, Cortex-M4 and Cortex-M7 families
 /// Described in section 4.5 of
@@ -136,18 +139,28 @@ const MPU_BASE_ADDRESS: StaticRef<MpuRegisters> =
 pub struct MPU<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> {
     /// MMIO reference to MPU registers.
     registers: StaticRef<MpuRegisters>,
+    /// Monotonically increasing counter for allocated regions, used
+    /// to assign unique IDs to `CortexMConfig` instances.
+    config_count: Cell<NonZeroUsize>,
     /// Optimization logic. This is used to indicate which application the MPU
     /// is currently configured for so that the MPU can skip updating when the
     /// kernel returns to the same app.
-    hardware_is_configured_for: OptionalCell<ProcessId>,
+    hardware_is_configured_for: OptionalCell<NonZeroUsize>,
 }
 
 impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> MPU<NUM_REGIONS, MIN_REGION_SIZE> {
     pub const unsafe fn new() -> Self {
         Self {
             registers: MPU_BASE_ADDRESS,
+            config_count: Cell::new(NonZeroUsize::MIN),
             hardware_is_configured_for: OptionalCell::empty(),
         }
+    }
+
+    // Function useful for boards where the bootloader sets up some
+    // MPU configuration that conflicts with Tock's configuration:
+    pub unsafe fn clear_mpu(&self) {
+        self.registers.ctrl.write(Control::ENABLE::CLEAR);
     }
 }
 
@@ -157,6 +170,9 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> MPU<NUM_REGIONS, MI
 /// unused regions may be configured as disabled). This struct caches the result
 /// of region configuration calculation.
 pub struct CortexMConfig<const NUM_REGIONS: usize> {
+    /// Unique ID for this configuration, assigned from a
+    /// monotonically increasing counter in the MPU struct.
+    id: NonZeroUsize,
     /// The computed region configuration for this process.
     regions: [CortexMRegion; NUM_REGIONS],
     /// Has the configuration changed since the last time the this process
@@ -169,20 +185,6 @@ pub struct CortexMConfig<const NUM_REGIONS: usize> {
 /// with indices above APP_MEMORY_REGION_MAX_NUM can be used for other MPU
 /// needs.
 const APP_MEMORY_REGION_MAX_NUM: usize = 1;
-
-impl<const NUM_REGIONS: usize> Default for CortexMConfig<NUM_REGIONS> {
-    fn default() -> Self {
-        // a bit of a hack to initialize array without unsafe
-        let mut ret = Self {
-            regions: [CortexMRegion::empty(0); NUM_REGIONS],
-            is_dirty: Cell::new(true),
-        };
-        for i in 0..NUM_REGIONS {
-            ret.regions[i] = CortexMRegion::empty(i);
-        }
-        ret
-    }
-}
 
 impl<const NUM_REGIONS: usize> fmt::Display for CortexMConfig<NUM_REGIONS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -262,9 +264,8 @@ pub struct CortexMRegion {
 
 impl PartialEq<mpu::Region> for CortexMRegion {
     fn eq(&self, other: &mpu::Region) -> bool {
-        self.location.map_or(false, |(addr, size)| {
-            addr == other.start_address() && size == other.size()
-        })
+        self.location
+            .is_some_and(|(addr, size)| addr == other.start_address() && size == other.size())
     }
 }
 
@@ -277,7 +278,13 @@ impl CortexMRegion {
         region_num: usize,
         subregions: Option<(usize, usize)>,
         permissions: mpu::Permissions,
-    ) -> CortexMRegion {
+    ) -> Option<CortexMRegion> {
+        // Logical size must be above minimum size for cortexM MPU regions and
+        // and less than the size of the underlying physical region
+        if logical_size < CORTEXM_MIN_REGION_SIZE || region_size < logical_size {
+            return None;
+        }
+
         // Determine access and execute permissions
         let (access, execute) = match permissions {
             mpu::Permissions::ReadWriteExecute => (
@@ -320,18 +327,18 @@ impl CortexMRegion {
         // To compute the mask, we start with all subregions disabled and enable
         // the ones in the inclusive range [min_subregion, max_subregion].
         if let Some((min_subregion, max_subregion)) = subregions {
-            let mask = (min_subregion..=max_subregion).fold(u8::max_value(), |res, i| {
+            let mask = (min_subregion..=max_subregion).fold(u8::MAX, |res, i| {
                 // Enable subregions bit by bit (1 ^ 1 == 0)
                 res ^ (1 << i)
             });
             attributes += RegionAttributes::SRD.val(mask as u32);
         }
 
-        CortexMRegion {
+        Some(CortexMRegion {
             location: Some((logical_start, logical_size)),
-            base_address: base_address,
-            attributes: attributes,
-        }
+            base_address,
+            attributes,
+        })
     }
 
     fn empty(region_num: usize) -> CortexMRegion {
@@ -368,11 +375,7 @@ impl CortexMRegion {
             None => return false,
         };
 
-        if region_start < other_end && other_start < region_end {
-            true
-        } else {
-            false
-        }
+        region_start < other_end && other_start < region_end
     }
 }
 
@@ -380,10 +383,6 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
     for MPU<NUM_REGIONS, MIN_REGION_SIZE>
 {
     type MpuConfig = CortexMConfig<NUM_REGIONS>;
-
-    fn clear_mpu(&self) {
-        self.registers.ctrl.write(Control::ENABLE::CLEAR);
-    }
 
     fn enable_app_mpu(&self) {
         // Enable the MPU, disable it during HardFault/NMI handlers, and allow
@@ -401,6 +400,31 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
 
     fn number_total_regions(&self) -> usize {
         self.registers.mpu_type.read(Type::DREGION) as usize
+    }
+
+    fn new_config(&self) -> Option<Self::MpuConfig> {
+        let id = self.config_count.get();
+        self.config_count.set(id.checked_add(1)?);
+
+        // Allocate the regions with index `0` first, then use `reset_config` to
+        // write the properly-indexed `CortexMRegion`s:
+        let mut ret = CortexMConfig {
+            id,
+            regions: [CortexMRegion::empty(0); NUM_REGIONS],
+            is_dirty: Cell::new(true),
+        };
+
+        self.reset_config(&mut ret);
+
+        Some(ret)
+    }
+
+    fn reset_config(&self, config: &mut Self::MpuConfig) {
+        for i in 0..NUM_REGIONS {
+            config.regions[i] = CortexMRegion::empty(i);
+        }
+
+        config.is_dirty.set(true);
     }
 
     fn allocate_region(
@@ -454,7 +478,7 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
                 let tz = start.trailing_zeros();
                 if tz < 32 {
                     // Find the largest power of two that divides `start`
-                    (1 as usize) << tz
+                    1_usize << tz
                 } else {
                     // This case means `start` is 0.
                     let mut ceil = math::closest_power_of_two(size as u32) as usize;
@@ -522,7 +546,7 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
             region_num,
             subregions,
             permissions,
-        );
+        )?;
 
         config.regions[region_num] = region;
         config.is_dirty.set(true);
@@ -661,7 +685,7 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
             0,
             Some((0, num_enabled_subregions0 - 1)),
             permissions,
-        );
+        )?;
 
         // We cannot have a completely unused MPU region
         let region1 = if num_enabled_subregions1 == 0 {
@@ -675,7 +699,7 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
                 1,
                 Some((0, num_enabled_subregions1 - 1)),
                 permissions,
-            )
+            )?
         };
 
         config.regions[0] = region0;
@@ -713,7 +737,7 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
 
         // Determine the number of subregions to enable.
         // Want `round_up(app_memory_size / subregion_size)`.
-        let num_enabled_subregions = (app_memory_size + subregion_size - 1) / subregion_size;
+        let num_enabled_subregions = app_memory_size.div_ceil(subregion_size);
 
         let subregions_enabled_end = region_start + subregion_size * num_enabled_subregions;
 
@@ -735,7 +759,8 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
             0,
             Some((0, num_enabled_subregions0 - 1)),
             permissions,
-        );
+        )
+        .ok_or(())?;
 
         let region1 = if num_enabled_subregions1 == 0 {
             CortexMRegion::empty(1)
@@ -749,6 +774,7 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
                 Some((0, num_enabled_subregions1 - 1)),
                 permissions,
             )
+            .ok_or(())?
         };
 
         config.regions[0] = region0;
@@ -758,16 +784,16 @@ impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
         Ok(())
     }
 
-    fn configure_mpu(&self, config: &Self::MpuConfig, processid: &ProcessId) {
+    fn configure_mpu(&self, config: &Self::MpuConfig) {
         // If the hardware is already configured for this app and the app's MPU
         // configuration has not changed, then skip the hardware update.
-        if !self.hardware_is_configured_for.contains(processid) || config.is_dirty.get() {
+        if !self.hardware_is_configured_for.contains(&config.id) || config.is_dirty.get() {
             // Set MPU regions
             for region in config.regions.iter() {
                 self.registers.rbar.write(region.base_address());
                 self.registers.rasr.write(region.attributes());
             }
-            self.hardware_is_configured_for.set(*processid);
+            self.hardware_is_configured_for.set(config.id);
             config.is_dirty.set(false);
         }
     }

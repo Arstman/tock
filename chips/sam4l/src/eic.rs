@@ -41,9 +41,11 @@ pub enum SynchronizationMode {
 }
 
 /// The sam4l chip supports 9 external interrupt lines: Ext1 - Ext8 and an additional
-/// Non-Maskable Interrupt (NMI) pin. NMI has the same properties as the other external
-/// interrupts, but is connected to the NMI request of the CPU, enabling it to interrupt
-/// any other interrupt mode.
+/// Non-Maskable Interrupt (NMI) pin.
+///
+/// NMI has the same properties as the other external interrupts, but
+/// is connected to the NMI request of the CPU, enabling it to
+/// interrupt any other interrupt mode.
 #[derive(Copy, Clone, Debug)]
 #[repr(u32)]
 pub enum Line {
@@ -68,7 +70,7 @@ pub struct EicRegisters {
     imr: ReadOnly<u32, Interrupt::Register>,
     /// A bit is set when an interrupt triggers
     isr: ReadOnly<u32, Interrupt::Register>,
-    /// Clears ISR  
+    /// Clears ISR
     icr: WriteOnly<u32, Interrupt::Register>,
     /// Sets interrupt mode
     mode: ReadWrite<u32, Interrupt::Register>,
@@ -138,7 +140,7 @@ impl PeripheralManagement<pm::Clock> for Eic<'_> {
     type RegisterType = EicRegisters;
 
     fn get_registers(&self) -> &EicRegisters {
-        &*EIC_BASE
+        &EIC_BASE
     }
 
     fn get_clock(&self) -> &pm::Clock {

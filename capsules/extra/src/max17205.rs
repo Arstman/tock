@@ -16,7 +16,7 @@
 //! Usage
 //! -----
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! // Two i2c addresses are necessary.
@@ -124,8 +124,8 @@ pub struct MAX17205<'a, I: i2c::I2CDevice> {
 impl<'a, I: i2c::I2CDevice> MAX17205<'a, I> {
     pub fn new(i2c_lower: &'a I, i2c_upper: &'a I, buffer: &'static mut [u8]) -> MAX17205<'a, I> {
         MAX17205 {
-            i2c_lower: i2c_lower,
-            i2c_upper: i2c_upper,
+            i2c_lower,
+            i2c_upper,
             state: Cell::new(State::Idle),
             soc: Cell::new(0),
             soc_mah: Cell::new(0),
@@ -230,7 +230,7 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                     client.status(
                         status,
                         match error {
-                            Ok(_) => Ok(()),
+                            Ok(()) => Ok(()),
                             Err(e) => Err(e.into()),
                         },
                     )
@@ -259,7 +259,7 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                 self.buffer.take().map(|selfbuf| {
                     // Get SOC mAh and percentage
                     // Write reqcap address
-                    selfbuf[0] = ((Registers::FullCapRep as u8) & 0xFF) as u8;
+                    selfbuf[0] = (Registers::FullCapRep as u8) & 0xFF;
                     // TODO verify errors
                     let _ = self.i2c_lower.write(selfbuf, 1);
 
@@ -281,7 +281,7 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                         self.soc_mah.get(),
                         full_mah,
                         match error {
-                            Ok(_) => Ok(()),
+                            Ok(()) => Ok(()),
                             Err(e) => Err(e.into()),
                         },
                     );
@@ -305,7 +305,7 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                     client.coulomb(
                         coulomb,
                         match error {
-                            Ok(_) => Ok(()),
+                            Ok(()) => Ok(()),
                             Err(e) => Err(e.into()),
                         },
                     );
@@ -331,7 +331,7 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                 // Now issue write of memory address of current
                 // Setup read capacity
                 self.buffer.take().map(|selfbuf| {
-                    selfbuf[0] = ((Registers::Current as u8) & 0xFF) as u8;
+                    selfbuf[0] = (Registers::Current as u8) & 0xFF;
                     // TODO verify errors
                     let _ = self.i2c_lower.write(selfbuf, 1);
 
@@ -352,7 +352,7 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                         self.voltage.get(),
                         current,
                         match error {
-                            Ok(_) => Ok(()),
+                            Ok(()) => Ok(()),
                             Err(e) => Err(e.into()),
                         },
                     )
@@ -373,14 +373,14 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
                     .iter()
                     .take(8)
                     .enumerate()
-                    .fold(0u64, |rid, (i, b)| rid | ((*b as u64) << i * 8));
+                    .fold(0u64, |rid, (i, b)| rid | ((*b as u64) << (i * 8)));
                 self.buffer.replace(buffer);
 
                 self.client.map(|client| {
                     client.romid(
                         rid,
                         match error {
-                            Ok(_) => Ok(()),
+                            Ok(()) => Ok(()),
                             Err(e) => Err(e.into()),
                         },
                     )
@@ -394,19 +394,27 @@ impl<I: i2c::I2CDevice> i2c::I2CClient for MAX17205<'_, I> {
     }
 }
 
+/// IDs for subscribed upcalls.
+mod upcall {
+    /// Callback for when all events complete or data is ready.
+    pub const EVENT_COMPLETE: usize = 0;
+    /// Number of upcalls.
+    pub const COUNT: u8 = 1;
+}
+
 #[derive(Default)]
 pub struct App {}
 
 pub struct MAX17205Driver<'a, I: i2c::I2CDevice> {
     max17205: &'a MAX17205<'a, I>,
     owning_process: OptionalCell<ProcessId>,
-    apps: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
+    apps: Grant<App, UpcallCount<{ upcall::COUNT }>, AllowRoCount<0>, AllowRwCount<0>>,
 }
 
 impl<'a, I: i2c::I2CDevice> MAX17205Driver<'a, I> {
     pub fn new(
         max: &'a MAX17205<I>,
-        grant: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
+        grant: Grant<App, UpcallCount<{ upcall::COUNT }>, AllowRoCount<0>, AllowRwCount<0>>,
     ) -> Self {
         Self {
             max17205: max,
@@ -419,10 +427,10 @@ impl<'a, I: i2c::I2CDevice> MAX17205Driver<'a, I> {
 impl<I: i2c::I2CDevice> MAX17205Client for MAX17205Driver<'_, I> {
     fn status(&self, status: u16, error: Result<(), ErrorCode>) {
         self.owning_process.map(|pid| {
-            let _ = self.apps.enter(*pid, |_app, upcalls| {
+            let _ = self.apps.enter(pid, |_app, upcalls| {
                 upcalls
                     .schedule_upcall(
-                        0,
+                        upcall::EVENT_COMPLETE,
                         (
                             kernel::errorcode::into_statuscode(error),
                             status as usize,
@@ -442,10 +450,10 @@ impl<I: i2c::I2CDevice> MAX17205Client for MAX17205Driver<'_, I> {
         error: Result<(), ErrorCode>,
     ) {
         self.owning_process.map(|pid| {
-            let _ = self.apps.enter(*pid, |_app, upcalls| {
+            let _ = self.apps.enter(pid, |_app, upcalls| {
                 upcalls
                     .schedule_upcall(
-                        0,
+                        upcall::EVENT_COMPLETE,
                         (
                             kernel::errorcode::into_statuscode(error),
                             percent as usize,
@@ -459,10 +467,10 @@ impl<I: i2c::I2CDevice> MAX17205Client for MAX17205Driver<'_, I> {
 
     fn voltage_current(&self, voltage: u16, current: u16, error: Result<(), ErrorCode>) {
         self.owning_process.map(|pid| {
-            let _ = self.apps.enter(*pid, |_app, upcalls| {
+            let _ = self.apps.enter(pid, |_app, upcalls| {
                 upcalls
                     .schedule_upcall(
-                        0,
+                        upcall::EVENT_COMPLETE,
                         (
                             kernel::errorcode::into_statuscode(error),
                             voltage as usize,
@@ -476,10 +484,10 @@ impl<I: i2c::I2CDevice> MAX17205Client for MAX17205Driver<'_, I> {
 
     fn coulomb(&self, coulomb: u16, error: Result<(), ErrorCode>) {
         self.owning_process.map(|pid| {
-            let _ = self.apps.enter(*pid, |_app, upcalls| {
+            let _ = self.apps.enter(pid, |_app, upcalls| {
                 upcalls
                     .schedule_upcall(
-                        0,
+                        upcall::EVENT_COMPLETE,
                         (
                             kernel::errorcode::into_statuscode(error),
                             coulomb as usize,
@@ -493,10 +501,10 @@ impl<I: i2c::I2CDevice> MAX17205Client for MAX17205Driver<'_, I> {
 
     fn romid(&self, rid: u64, error: Result<(), ErrorCode>) {
         self.owning_process.map(|pid| {
-            let _ = self.apps.enter(*pid, |_app, upcalls| {
+            let _ = self.apps.enter(pid, |_app, upcalls| {
                 upcalls
                     .schedule_upcall(
-                        0,
+                        upcall::EVENT_COMPLETE,
                         (
                             kernel::errorcode::into_statuscode(error),
                             (rid & 0xffffffff) as usize,
@@ -510,17 +518,11 @@ impl<I: i2c::I2CDevice> MAX17205Client for MAX17205Driver<'_, I> {
 }
 
 impl<I: i2c::I2CDevice> SyscallDriver for MAX17205Driver<'_, I> {
-    // Setup callback.
-    //
-    // ### `subscribe_num`
-    //
-    // - `0`: Setup a callback for when all events complete or data is ready.
-
     /// Setup and read the MAX17205.
     ///
     /// ### `command_num`
     ///
-    /// - `0`: Driver check.
+    /// - `0`: Driver existence check.
     /// - `1`: Read the current status of the MAX17205.
     /// - `2`: Read the current state of charge percent.
     /// - `3`: Read the current voltage and current draw.
@@ -542,7 +544,7 @@ impl<I: i2c::I2CDevice> SyscallDriver for MAX17205Driver<'_, I> {
         // some (alive) process
         let match_or_empty_or_nonexistant = self.owning_process.map_or(true, |current_process| {
             self.apps
-                .enter(*current_process, |_, _| current_process == &process_id)
+                .enter(current_process, |_, _| current_process == process_id)
                 .unwrap_or(true)
         });
         if match_or_empty_or_nonexistant {

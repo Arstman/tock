@@ -8,7 +8,8 @@
 //! If you are writing and the buffer fills up, you can make the size of
 //! `output_buffer` larger.
 //!
-//! Before debug interfaces can be used, the board file must assign them hardware:
+//! Before debug interfaces can be used, the board file must assign them
+//! hardware:
 //!
 //! ```ignore
 //! kernel::debug::assign_gpios(
@@ -17,22 +18,15 @@
 //!     None,
 //! );
 //!
-//! components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(components::debug_writer_component_static!());
-//! ```
-//!
-//! The debug queue is optional, if not set in the board it is just ignored.
-//! You can add one in the board file as follows:
-//!
-//! ```ignore
-//! components::debug_queue::DebugQueueComponent::new()
-//!     .finalize(components::debug_queue_component_static!());
+//! components::debug_writer::DebugWriterComponent::new(uart_mux)
+//!     .finalize(components::debug_writer_component_static!());
 //! ```
 //!
 //! Example
 //! -------
 //!
 //! ```no_run
-//! # use kernel::{debug, debug_enqueue, debug_flush_queue, debug_gpio, debug_verbose};
+//! # use kernel::{debug, debug_gpio, debug_verbose};
 //! # fn main() {
 //! # let i = 42;
 //! debug!("Yes the code gets here with value {}", i);
@@ -40,11 +34,6 @@
 //!
 //! debug_gpio!(0, toggle); // Toggles the first debug GPIO.
 //!
-//! debug_enqueue!("foo"); // Adds some message to the debug queue.
-//! debug_flush_queue!(); // Flushes the queue, writing "foo".
-//! debug_enqueue!("bar");
-//! panic!("42"); // Flushes the queue, writing "bar" in the debug queue section
-//!               // of the panic diagnostic.
 //! # }
 //! ```
 //!
@@ -56,6 +45,7 @@
 use core::cell::Cell;
 use core::fmt::{write, Arguments, Result, Write};
 use core::panic::PanicInfo;
+use core::ptr::addr_of_mut;
 use core::str;
 
 use crate::collections::queue::Queue;
@@ -70,18 +60,22 @@ use crate::utilities::cells::NumericCellExt;
 use crate::utilities::cells::{MapCell, TakeCell};
 use crate::ErrorCode;
 
-/// This trait is similar to std::io::Write in that it takes bytes instead of a string (contrary to
-/// core::fmt::Write), but io::Write isn't available in no_std (due to std::io::Error not being
-/// available).
+/// Implementation of `std::io::Write` for `no_std`.
 ///
-/// Also, in our use cases, writes are infaillible, so the write function cannot return an Error,
-/// however it might not be able to write everything, so it returns  the number of bytes written.
+/// This takes bytes instead of a string (contrary to [`core::fmt::Write`]), but
+/// we cannot use `std::io::Write' as it isn't available in `no_std` (due to
+/// `std::io::Error` not being available).
 ///
-/// See also the tracking issue: <https://github.com/rust-lang/rfcs/issues/2262>
+/// Also, in our use cases, writes are infallible, so the write function cannot
+/// return an `Err`, however it might not be able to write everything, so it
+/// returns the number of bytes written.
+///
+/// See also the tracking issue:
+/// <https://github.com/rust-lang/rfcs/issues/2262>.
 pub trait IoWrite {
     fn write(&mut self, buf: &[u8]) -> usize;
 
-    fn write_ring_buffer<'a>(&mut self, buf: &RingBuffer<'a, u8>) -> usize {
+    fn write_ring_buffer(&mut self, buf: &RingBuffer<'_, u8>) -> usize {
         let (left, right) = buf.as_slices();
         let mut total = 0;
         if let Some(slice) = left {
@@ -99,13 +93,13 @@ pub trait IoWrite {
 
 /// Tock panic routine, without the infinite LED-blinking loop.
 ///
-/// This is useful for boards which do not feature LEDs to blink or
-/// want to implement their own behaviour. This method returns after
-/// performing the panic dump.
+/// This is useful for boards which do not feature LEDs to blink or want to
+/// implement their own behavior. This method returns after performing the panic
+/// dump.
 ///
-/// After this method returns, the system is no longer in a
-/// well-defined state. Care must be taken on how one interacts with
-/// the system once this function returns.
+/// After this method returns, the system is no longer in a well-defined state.
+/// Care must be taken on how one interacts with the system once this function
+/// returns.
 ///
 /// **NOTE:** The supplied `writer` must be synchronous.
 pub unsafe fn panic_print<W: Write + IoWrite, C: Chip, PP: ProcessPrinter>(
@@ -117,16 +111,28 @@ pub unsafe fn panic_print<W: Write + IoWrite, C: Chip, PP: ProcessPrinter>(
     process_printer: &'static Option<&'static PP>,
 ) {
     panic_begin(nop);
-    panic_banner(writer, panic_info);
     // Flush debug buffer if needed
     flush(writer);
+    panic_banner(writer, panic_info);
     panic_cpu_state(chip, writer);
+
+    // Some systems may enforce memory protection regions for the kernel, making
+    // application memory inaccessible. However, printing process information
+    // will attempt to access memory. If we are provided a chip reference,
+    // attempt to disable userspace memory protection first:
+    chip.map(|c| {
+        use crate::platform::mpu::MPU;
+        c.mpu().disable_app_mpu()
+    });
     panic_process_info(processes, process_printer, writer);
 }
 
 /// Tock default panic routine.
 ///
 /// **NOTE:** The supplied `writer` must be synchronous.
+///
+/// This will print a detailed debugging message and then loop forever while
+/// blinking an LED in a recognizable pattern.
 pub unsafe fn panic<L: hil::led::Led, W: Write + IoWrite, C: Chip, PP: ProcessPrinter>(
     leds: &mut [&L],
     writer: &mut W,
@@ -136,8 +142,8 @@ pub unsafe fn panic<L: hil::led::Led, W: Write + IoWrite, C: Chip, PP: ProcessPr
     chip: &'static Option<&'static C>,
     process_printer: &'static Option<&'static PP>,
 ) -> ! {
-    // Call `panic_print` first which will print out the panic
-    // information and return
+    // Call `panic_print` first which will print out the panic information and
+    // return
     panic_print(writer, panic_info, nop, processes, chip, process_printer);
 
     // The system is no longer in a well-defined state, we cannot
@@ -195,8 +201,8 @@ pub unsafe fn panic_process_info<PP: ProcessPrinter, W: Write>(
     process_printer.map(|printer| {
         // print data about each process
         let _ = writer.write_fmt(format_args!("\r\n---| App Status |---\r\n"));
-        for idx in 0..procs.len() {
-            procs[idx].map(|process| {
+        for proc in procs {
+            proc.map(|process| {
                 // Print the memory map and basic process info.
                 //
                 // Because we are using a synchronous printer we do not need to
@@ -211,14 +217,18 @@ pub unsafe fn panic_process_info<PP: ProcessPrinter, W: Write>(
 
 /// Blinks a recognizable pattern forever.
 ///
-/// If a multi-color LED is used for the panic pattern, it is
-/// advised to turn off other LEDs before calling this method.
+/// The LED will blink "sporadically" in a somewhat irregular pattern. This
+/// should look different from a traditional blinking LED which typically blinks
+/// with a consistent duty cycle. The panic blinking sequence is intentionally
+/// unusual to make it easier to tell when a panic has occurred.
 ///
-/// Generally, boards should blink red during panic if possible,
-/// otherwise choose the 'first' or most prominent LED. Some
-/// boards may find it appropriate to blink multiple LEDs (e.g.
-/// one on the top and one on the bottom), thus this method
-/// accepts an array, however most will only need one.
+/// If a multi-color LED is used for the panic pattern, it is advised to turn
+/// off other LEDs before calling this method.
+///
+/// Generally, boards should blink red during panic if possible, otherwise
+/// choose the 'first' or most prominent LED. Some boards may find it
+/// appropriate to blink multiple LEDs (e.g. one on the top and one on the
+/// bottom), thus this method accepts an array, however most will only need one.
 pub fn panic_blink_forever<L: hil::led::Led>(leds: &mut [&L]) -> ! {
     leds.iter_mut().for_each(|led| led.init());
     loop {
@@ -243,12 +253,14 @@ pub fn panic_blink_forever<L: hil::led::Led>(leds: &mut [&L]) -> ! {
 ///////////////////////////////////////////////////////////////////
 // debug_gpio! support
 
+/// Object to hold the assigned debugging GPIOs.
 pub static mut DEBUG_GPIOS: (
     Option<&'static dyn hil::gpio::Pin>,
     Option<&'static dyn hil::gpio::Pin>,
     Option<&'static dyn hil::gpio::Pin>,
 ) = (None, None, None);
 
+/// Map up to three GPIO pins to use for debugging.
 pub unsafe fn assign_gpios(
     gpio0: Option<&'static dyn hil::gpio::Pin>,
     gpio1: Option<&'static dyn hil::gpio::Pin>,
@@ -259,7 +271,7 @@ pub unsafe fn assign_gpios(
     DEBUG_GPIOS.2 = gpio2;
 }
 
-/// In-kernel gpio debugging, accepts any GPIO HIL method
+/// In-kernel gpio debugging that accepts any GPIO HIL method.
 #[macro_export]
 macro_rules! debug_gpio {
     ($i:tt, $method:ident $(,)?) => {{
@@ -271,111 +283,15 @@ macro_rules! debug_gpio {
 }
 
 ///////////////////////////////////////////////////////////////////
-// debug_enqueue! support
-
-/// Wrapper type that we need a mutable reference to for the core::fmt::Write
-/// interface.
-pub struct DebugQueueWrapper {
-    dw: MapCell<&'static DebugQueue>,
-}
-
-impl DebugQueueWrapper {
-    pub fn new(dw: &'static DebugQueue) -> Self {
-        Self {
-            dw: MapCell::new(dw),
-        }
-    }
-}
-
-pub struct DebugQueue {
-    ring_buffer: TakeCell<'static, RingBuffer<'static, u8>>,
-}
-
-impl DebugQueue {
-    pub fn new(ring_buffer: &'static mut RingBuffer<'static, u8>) -> Self {
-        Self {
-            ring_buffer: TakeCell::new(ring_buffer),
-        }
-    }
-}
-
-static mut DEBUG_QUEUE: Option<&'static mut DebugQueueWrapper> = None;
-
-/// Function used by board main.rs to set a reference to the debug queue.
-pub unsafe fn set_debug_queue(buffer: &'static mut DebugQueueWrapper) {
-    DEBUG_QUEUE = Some(buffer);
-}
-
-impl Write for DebugQueueWrapper {
-    fn write_str(&mut self, s: &str) -> Result {
-        self.dw.map(|dw| {
-            dw.ring_buffer.map(|ring_buffer| {
-                let bytes = s.as_bytes();
-                for &b in bytes {
-                    ring_buffer.push(b);
-                }
-            });
-        });
-
-        Ok(())
-    }
-}
-
-pub fn debug_enqueue_fmt(args: Arguments) {
-    unsafe { DEBUG_QUEUE.as_deref_mut() }.map(|buffer| {
-        let _ = write(buffer, args);
-        let _ = buffer.write_str("\r\n");
-    });
-}
-
-pub fn debug_flush_queue_() {
-    let writer = unsafe { get_debug_writer() };
-
-    unsafe { DEBUG_QUEUE.as_deref_mut() }.map(|buffer| {
-        buffer.dw.map(|dw| {
-            dw.ring_buffer.map(|ring_buffer| {
-                writer.write_ring_buffer(ring_buffer);
-                ring_buffer.empty();
-            });
-        });
-    });
-}
-
-/// This macro prints a new line to an internal ring buffer, the contents of
-/// which are only flushed with `debug_flush_queue!` and in the panic handler.
-#[macro_export]
-macro_rules! debug_enqueue {
-    () => ({
-        debug_enqueue!("")
-    });
-    ($msg:expr $(,)?) => ({
-        $crate::debug::debug_enqueue_fmt(format_args!($msg))
-    });
-    ($fmt:expr, $($arg:tt)+) => ({
-        $crate::debug::debug_enqueue_fmt(format_args!($fmt, $($arg)+))
-    });
-}
-
-/// This macro flushes the contents of the debug queue into the regular
-/// debug output.
-#[macro_export]
-macro_rules! debug_flush_queue {
-    () => {{
-        $crate::debug::debug_flush_queue_()
-    }};
-}
-
-///////////////////////////////////////////////////////////////////
 // debug! and debug_verbose! support
 
-/// Wrapper type that we need a mutable reference to for the core::fmt::Write
-/// interface.
+/// Wrapper type that we need a mutable reference to for the
+/// [`core::fmt::Write`] interface.
 pub struct DebugWriterWrapper {
     dw: MapCell<&'static DebugWriter>,
 }
 
-/// Main type that we need an immutable reference to so we can share it with
-/// the UART provider and this debug module.
+/// Main type that we share with the UART provider and this debug module.
 pub struct DebugWriter {
     // What provides the actual writing mechanism.
     uart: &'static dyn hil::uart::Transmit<'static>,
@@ -387,12 +303,14 @@ pub struct DebugWriter {
     count: Cell<usize>,
 }
 
-/// Static variable that holds the kernel's reference to the debug tool. This is
-/// needed so the debug!() macros have a reference to the object to use.
+/// Static variable that holds the kernel's reference to the debug tool.
+///
+/// This is needed so the `debug!()` macros have a reference to the object to
+/// use.
 static mut DEBUG_WRITER: Option<&'static mut DebugWriterWrapper> = None;
 
 unsafe fn try_get_debug_writer() -> Option<&'static mut DebugWriterWrapper> {
-    DEBUG_WRITER.as_deref_mut()
+    (*addr_of_mut!(DEBUG_WRITER)).as_deref_mut()
 }
 
 unsafe fn get_debug_writer() -> &'static mut DebugWriterWrapper {
@@ -419,7 +337,7 @@ impl DebugWriter {
         internal_buffer: &'static mut RingBuffer<'static, u8>,
     ) -> DebugWriter {
         DebugWriter {
-            uart: uart,
+            uart,
             output_buffer: TakeCell::new(out_buffer),
             internal_buffer: TakeCell::new(internal_buffer),
             count: Cell::new(0), // how many debug! calls
@@ -560,6 +478,7 @@ impl Write for DebugWriterWrapper {
     }
 }
 
+/// Write a debug message without a trailing newline.
 pub fn debug_print(args: Arguments) {
     let writer = unsafe { get_debug_writer() };
 
@@ -567,6 +486,7 @@ pub fn debug_print(args: Arguments) {
     writer.publish_bytes();
 }
 
+/// Write a debug message with a trailing newline.
 pub fn debug_println(args: Arguments) {
     let writer = unsafe { get_debug_writer() };
 
@@ -575,6 +495,7 @@ pub fn debug_println(args: Arguments) {
     writer.publish_bytes();
 }
 
+/// Write a [`ReadableProcessSlice`] to the debug output.
 pub fn debug_slice(slice: &ReadableProcessSlice) -> usize {
     let writer = unsafe { get_debug_writer() };
     let mut total = 0;
@@ -582,7 +503,7 @@ pub fn debug_slice(slice: &ReadableProcessSlice) -> usize {
         let buf: [u8; 1] = [b.get(); 1];
         let count = writer.write(&buf);
         if count > 0 {
-            total = total + count;
+            total += count;
         } else {
             break;
         }
@@ -591,6 +512,7 @@ pub fn debug_slice(slice: &ReadableProcessSlice) -> usize {
     total
 }
 
+/// Return how many bytes are remaining in the internal debug buffer.
 pub fn debug_available_len() -> usize {
     let writer = unsafe { get_debug_writer() };
     writer.available_len()
@@ -602,6 +524,8 @@ fn write_header(writer: &mut DebugWriterWrapper, (file, line): &(&'static str, u
     writer.write_fmt(format_args!("TOCK_DEBUG({}): {}:{}: ", count, file, line))
 }
 
+/// Write a debug message with file and line information without a trailing
+/// newline.
 pub fn debug_verbose_print(args: Arguments, file_line: &(&'static str, u32)) {
     let writer = unsafe { get_debug_writer() };
 
@@ -610,6 +534,8 @@ pub fn debug_verbose_print(args: Arguments, file_line: &(&'static str, u32)) {
     writer.publish_bytes();
 }
 
+/// Write a debug message with file and line information with a trailing
+/// newline.
 pub fn debug_verbose_println(args: Arguments, file_line: &(&'static str, u32)) {
     let writer = unsafe { get_debug_writer() };
 
@@ -665,18 +591,18 @@ macro_rules! debug_verbose {
     });
 }
 
-#[macro_export]
 /// Prints out the expression and its location, then returns it.
 ///
 /// ```rust,ignore
 /// let foo: u8 = debug_expr!(0xff);
 /// // Prints [main.rs:2] 0xff = 255
 /// ```
-/// Taken straight from Rust std::dbg.
+/// Taken straight from Rust `std::dbg`.
+#[macro_export]
 macro_rules! debug_expr {
-    // NOTE: We cannot use `concat!` to make a static string as a format argument
-    // of `eprintln!` because `file!` could contain a `{` or
-    // `$val` expression could be a block (`{ .. }`), in which case the `eprintln!`
+    // NOTE: We cannot use `concat!` to make a static string as a format
+    // argument of `eprintln!` because `file!` could contain a `{` or `$val`
+    // expression could be a block (`{ .. }`), in which case the `eprintln!`
     // will be malformed.
     () => {
         $crate::debug!("[{}:{}]", file!(), line!())
@@ -697,20 +623,7 @@ macro_rules! debug_expr {
     };
 }
 
-pub trait Debug {
-    fn write(&self, buf: &'static mut [u8], len: usize) -> usize;
-}
-
-#[cfg(debug = "true")]
-impl Default for Debug {
-    fn write(&self, buf: &'static mut [u8], len: usize) {
-        panic!(
-            "No registered kernel debug printer. Thrown printing {:?}",
-            buf
-        );
-    }
-}
-
+/// Flush any stored messages to the output writer.
 pub unsafe fn flush<W: Write + IoWrite>(writer: &mut W) {
     if let Some(debug_writer) = try_get_debug_writer() {
         if let Some(ring_buffer) = debug_writer.extract() {
@@ -720,22 +633,6 @@ pub unsafe fn flush<W: Write + IoWrite>(writer: &mut W) {
                 );
 
                 writer.write_ring_buffer(ring_buffer);
-            }
-        }
-
-        match DEBUG_QUEUE.as_deref_mut() {
-            None => {
-                let _ = writer.write_str(
-                    "\r\n---| No debug queue found. You can set it with the DebugQueue component.\r\n",
-                );
-            }
-            Some(buffer) => {
-                let _ = writer.write_str("\r\n---| Flushing debug queue:\r\n");
-                buffer.dw.map(|dw| {
-                    dw.ring_buffer.map(|ring_buffer| {
-                        writer.write_ring_buffer(ring_buffer);
-                    });
-                });
             }
         }
     } else {

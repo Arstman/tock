@@ -11,7 +11,6 @@ use crate::net::util::{network_slice_to_u16, u16_to_network_slice};
 /// Implements the 6LoWPAN specification for sending IPv6 datagrams over
 /// 802.15.4 packets efficiently, as detailed in RFC 6282.
 use core::mem;
-use core::result::Result;
 
 /// Contains bit masks and constants related to the two-byte header of the
 /// LoWPAN_IPHC encoding format.
@@ -95,6 +94,8 @@ pub struct Context {
     pub compress: bool,
 }
 
+/// LoWPan ContextStore
+///
 /// LoWPAN encoding requires being able to look up the existence of contexts,
 /// which are essentially IPv6 address prefixes. Any implementation must ensure
 /// that context 0 is always available and contains the mesh-local prefix.
@@ -113,15 +114,15 @@ pub trait ContextStore {
 /// Computes the LoWPAN Interface Identifier from either the 16-bit short MAC or
 /// the IEEE EUI-64 that is derived from the 48-bit MAC.
 pub fn compute_iid(mac_addr: &MacAddress) -> [u8; 8] {
-    match mac_addr {
-        &MacAddress::Short(short_addr) => {
+    match *mac_addr {
+        MacAddress::Short(short_addr) => {
             // IID is 0000:00ff:fe00:XXXX, where XXXX is 16-bit MAC
             let mut iid: [u8; 8] = iphc::MAC_BASE;
             iid[6] = (short_addr >> 1) as u8;
             iid[7] = (short_addr & 0xff) as u8;
             iid
         }
-        &MacAddress::Long(long_addr) => {
+        MacAddress::Long(long_addr) => {
             // IID is IEEE EUI-64 with universal/local bit inverted
             let mut iid: [u8; 8] = long_addr;
             iid[0] ^= iphc::MAC_UL;
@@ -192,7 +193,7 @@ pub fn compress<'a>(
     ip6_packet: &'a IP6Packet<'a>,
     src_mac_addr: MacAddress,
     dst_mac_addr: MacAddress,
-    mut buf: &mut [u8],
+    buf: &mut [u8],
 ) -> Result<(usize, usize), ()> {
     // Note that consumed should be constant, and equal sizeof(IP6Header)
     //let (mut consumed, ip6_header) = IP6Header::decode(ip6_datagram).done().ok_or(())?;
@@ -226,38 +227,38 @@ pub fn compress<'a>(
     dst_ctx = dst_ctx.and_then(|ctx| if ctx.compress { Some(ctx) } else { None });
 
     // Context Identifier Extension
-    compress_cie(&src_ctx, &dst_ctx, &mut buf, &mut written);
+    compress_cie(src_ctx.as_ref(), dst_ctx.as_ref(), buf, &mut written);
 
     // Traffic Class & Flow Label
-    compress_tf(&ip6_header, &mut buf, &mut written);
+    compress_tf(&ip6_header, buf, &mut written);
 
     // Next Header
 
     //let (mut is_nhc, mut nh_len): (bool, u8) = is_ip6_nh_compressible(ip6_packet)?;
     let is_nhc = ip6_header.next_header == ip6_nh::UDP;
-    compress_nh(&ip6_header, is_nhc, &mut buf, &mut written);
+    compress_nh(&ip6_header, is_nhc, buf, &mut written);
 
     // Hop Limit
-    compress_hl(&ip6_header, &mut buf, &mut written);
+    compress_hl(&ip6_header, buf, &mut written);
 
     // Source Address
     compress_src(
         &ip6_header.src_addr,
         &src_mac_addr,
-        &src_ctx,
-        &mut buf,
+        src_ctx.as_ref(),
+        buf,
         &mut written,
     );
 
     // Destination Address
     if ip6_header.dst_addr.is_multicast() {
-        compress_multicast(&ip6_header.dst_addr, &dst_ctx, &mut buf, &mut written);
+        compress_multicast(&ip6_header.dst_addr, dst_ctx.as_ref(), buf, &mut written);
     } else {
         compress_dst(
             &ip6_header.dst_addr,
             &dst_mac_addr,
-            &dst_ctx,
-            &mut buf,
+            dst_ctx.as_ref(),
+            buf,
             &mut written,
         );
     }
@@ -276,8 +277,8 @@ pub fn compress<'a>(
                 written += 1;
 
                 // Compress ports and checksum
-                nhc_header |= compress_udp_ports(&udp_header, &mut buf, &mut written);
-                nhc_header |= compress_udp_checksum(&udp_header, &mut buf, &mut written);
+                nhc_header |= compress_udp_ports(&udp_header, buf, &mut written);
+                nhc_header |= compress_udp_checksum(&udp_header, buf, &mut written);
 
                 // Write the UDP LoWPAN_NHC byte
                 buf[udp_nh_offset] = nhc_header;
@@ -292,8 +293,8 @@ pub fn compress<'a>(
 }
 
 fn compress_cie(
-    src_ctx: &Option<Context>,
-    dst_ctx: &Option<Context>,
+    src_ctx: Option<&Context>,
+    dst_ctx: Option<&Context>,
     buf: &mut [u8],
     written: &mut usize,
 ) {
@@ -379,7 +380,7 @@ fn compress_hl(ip6_header: &IP6Header, buf: &mut [u8], written: &mut usize) {
 fn compress_src(
     src_ip_addr: &IPAddr,
     src_mac_addr: &MacAddress,
-    src_ctx: &Option<Context>,
+    src_ctx: Option<&Context>,
     buf: &mut [u8],
     written: &mut usize,
 ) {
@@ -446,7 +447,7 @@ fn compress_iid(
 fn compress_dst(
     dst_ip_addr: &IPAddr,
     dst_mac_addr: &MacAddress,
-    dst_ctx: &Option<Context>,
+    dst_ctx: Option<&Context>,
     buf: &mut [u8],
     written: &mut usize,
 ) {
@@ -471,7 +472,7 @@ fn compress_dst(
 // Compresses multicast destination addresses
 fn compress_multicast(
     dst_ip_addr: &IPAddr,
-    dst_ctx: &Option<Context>,
+    dst_ctx: Option<&Context>,
     buf: &mut [u8],
     written: &mut usize,
 ) {
@@ -621,16 +622,16 @@ pub fn decompress(
     let mut written: usize = mem::size_of::<IP6Header>();
 
     // Decompress CID and CIE fields if they exist
-    let (src_ctx, dst_ctx) = decompress_cie(ctx_store, iphc_header_1, &buf, &mut consumed)?;
+    let (src_ctx, dst_ctx) = decompress_cie(ctx_store, iphc_header_1, buf, &mut consumed)?;
 
     // Traffic Class & Flow Label
-    decompress_tf(&mut ip6_header, iphc_header_1, &buf, &mut consumed);
+    decompress_tf(&mut ip6_header, iphc_header_1, buf, &mut consumed);
 
     // Next Header
-    let (mut is_nhc, mut next_header) = decompress_nh(iphc_header_1, &buf, &mut consumed);
+    let (mut is_nhc, mut next_header) = decompress_nh(iphc_header_1, buf, &mut consumed);
 
     // Hop Limit
-    decompress_hl(&mut ip6_header, iphc_header_1, &buf, &mut consumed)?;
+    decompress_hl(&mut ip6_header, iphc_header_1, buf, &mut consumed)?;
 
     // Source Address
     decompress_src(
@@ -638,26 +639,20 @@ pub fn decompress(
         iphc_header_2,
         &src_mac_addr,
         &src_ctx,
-        &buf,
+        buf,
         &mut consumed,
     )?;
 
     // Destination Address
     if (iphc_header_2 & iphc::MULTICAST) != 0 {
-        decompress_multicast(
-            &mut ip6_header,
-            iphc_header_2,
-            &dst_ctx,
-            &buf,
-            &mut consumed,
-        )?;
+        decompress_multicast(&mut ip6_header, iphc_header_2, &dst_ctx, buf, &mut consumed)?;
     } else {
         decompress_dst(
             &mut ip6_header,
             iphc_header_2,
             &dst_mac_addr,
             &dst_ctx,
-            &buf,
+            buf,
             &mut consumed,
         )?;
     }
@@ -678,7 +673,7 @@ pub fn decompress(
         consumed += 1;
 
         // Scoped mutable borrow of out_buf
-        let mut next_headers: &mut [u8] = &mut out_buf[written..];
+        let next_headers: &mut [u8] = &mut out_buf[written..];
 
         match next_header {
             ip6_nh::IP6 => {
@@ -687,7 +682,7 @@ pub fn decompress(
                     &buf[consumed..],
                     src_mac_addr,
                     dst_mac_addr,
-                    &mut next_headers,
+                    next_headers,
                     dgram_size,
                     is_fragment,
                 )?;
@@ -706,7 +701,7 @@ pub fn decompress(
 
                 // Decompress UDP header fields
                 let consumed_before_port_decompress = consumed;
-                let (src_port, dst_port) = decompress_udp_ports(nhc_header, &buf, &mut consumed);
+                let (src_port, dst_port) = decompress_udp_ports(nhc_header, buf, &mut consumed);
 
                 //need to add any growth from decompression to the udp length if we used the buf
                 //len to calculate the length
@@ -737,7 +732,7 @@ pub fn decompress(
                     &next_headers[0..8],
                     udp_length,
                     &ip6_header,
-                    &buf,
+                    buf,
                     &mut consumed,
                     is_fragment,
                 );

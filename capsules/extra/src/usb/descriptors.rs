@@ -8,7 +8,6 @@
 
 use core::cell::Cell;
 use core::cmp::min;
-use core::convert::From;
 use core::fmt;
 
 use kernel::hil::usb::TransferType;
@@ -30,7 +29,7 @@ pub struct Buffer64 {
 impl Default for Buffer64 {
     fn default() -> Self {
         Self {
-            buf: [(); 64].map(|_| VolatileCell::default()),
+            buf: [(); 64].map(|()| VolatileCell::default()),
         }
     }
 }
@@ -414,12 +413,14 @@ impl DescriptorBuffer {
 }
 
 /// Transform descriptor structs into descriptor buffers that can be
-/// passed into the control endpoint handler. Each endpoint descriptor list
-/// corresponds to the matching index in the interface descriptor list. For
-/// example, if the interface descriptor list contains `[ID1, ID2, ID3]`,
-/// and the endpoint descriptors list is `[[ED1, ED2], [ED3, ED4, ED5],
-/// [ED6]]`, then the third interface descriptor (`ID3`) has one
-/// corresponding endpoint descriptor (`ED6`).
+/// passed into the control endpoint handler.
+///
+/// Each endpoint descriptor list corresponds to the matching index in
+/// the interface descriptor list. For example, if the interface
+/// descriptor list contains `[ID1, ID2, ID3]`, and the endpoint
+/// descriptors list is `[[ED1, ED2], [ED3, ED4, ED5], [ED6]]`, then
+/// the third interface descriptor (`ID3`) has one corresponding
+/// endpoint descriptor (`ED6`).
 pub fn create_descriptor_buffers(
     device_descriptor: DeviceDescriptor,
     mut configuration_descriptor: ConfigurationDescriptor,
@@ -701,7 +702,7 @@ impl Descriptor for EndpointDescriptor {
         // The below implicitly sets Synchronization Type to "No Synchronization" and
         // Usage Type to "Data endpoint"
         buf[3].set(self.transfer_type as u8);
-        put_u16(&buf[4..6], self.max_packet_size & 0x7ff as u16);
+        put_u16(&buf[4..6], self.max_packet_size & 0x7ff_u16);
         buf[6].set(self.interval);
         len
     }
@@ -758,7 +759,7 @@ pub struct HIDSubordinateDescriptor {
     pub len: u16,
 }
 
-impl<'a> Descriptor for HIDDescriptor<'a> {
+impl Descriptor for HIDDescriptor<'_> {
     fn size(&self) -> usize {
         6 + (3 * self.sub_descriptors.len())
     }
@@ -782,7 +783,7 @@ pub struct ReportDescriptor<'a> {
     pub desc: &'a [u8],
 }
 
-impl<'a> Descriptor for ReportDescriptor<'a> {
+impl Descriptor for ReportDescriptor<'_> {
     fn size(&self) -> usize {
         self.desc.len()
     }
@@ -893,7 +894,7 @@ pub struct LanguagesDescriptor<'a> {
     pub langs: &'a [u16],
 }
 
-impl<'a> Descriptor for LanguagesDescriptor<'a> {
+impl Descriptor for LanguagesDescriptor<'_> {
     fn size(&self) -> usize {
         2 + (2 * self.langs.len())
     }
@@ -913,7 +914,7 @@ pub struct StringDescriptor<'a> {
     pub string: &'a str,
 }
 
-impl<'a> Descriptor for StringDescriptor<'a> {
+impl Descriptor for StringDescriptor<'_> {
     fn size(&self) -> usize {
         let mut len = 2;
         for ch in self.string.chars() {
@@ -949,7 +950,7 @@ fn get_u32(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
 }
 
 /// Write a `u16` to a buffer for transmission on the bus
-fn put_u16<'a>(buf: &'a [Cell<u8>], n: u16) {
+fn put_u16(buf: &[Cell<u8>], n: u16) {
     buf[0].set((n & 0xff) as u8);
     buf[1].set((n >> 8) as u8);
 }

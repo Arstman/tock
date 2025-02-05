@@ -9,7 +9,7 @@
 //!
 //! Right now, the stack looks like this:
 //!
-//! ```
+//! ```text
 //!                  Client
 //!                  |   ^
 //!             |-----   |
@@ -85,8 +85,9 @@ pub struct ClientCtrl<'a, 'b, U: 'a> {
 }
 
 /// States for the individual endpoints.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 enum State {
+    #[default]
     Init,
 
     /// We are doing a Control In transfer of some data in
@@ -97,12 +98,6 @@ enum State {
     CtrlOut,
 
     SetAddress,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        State::Init
-    }
 }
 
 impl<'a, 'b, U: hil::usb::UsbController<'a>> ClientCtrl<'a, 'b, U> {
@@ -116,7 +111,7 @@ impl<'a, 'b, U: hil::usb::UsbController<'a>> ClientCtrl<'a, 'b, U> {
         strings: &'b [&'b str],
     ) -> Self {
         ClientCtrl {
-            controller: controller,
+            controller,
             state: Default::default(),
             // For the moment, the Default trait is not implemented for arrays
             // of length > 32, and the Cell type is not Copy, so we have to

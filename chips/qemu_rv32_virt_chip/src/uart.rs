@@ -81,7 +81,7 @@ impl Uart16550Registers {
 
         // Read the old values of rbr_thr and ier and combine them
         // into a u16
-        let old_val = u16::from_be_bytes([self.ier.get() as u8, self.rbr_thr.get() as u8]);
+        let old_val = u16::from_be_bytes([self.ier.get(), self.rbr_thr.get()]);
 
         // Set DLAB = 0 prior to handing back to the caller
         self.lcr.modify(dlab_field.val(0));
@@ -240,7 +240,7 @@ impl<'a> Uart16550<'a> {
     }
 }
 
-impl<'a> Uart16550<'a> {
+impl Uart16550<'_> {
     pub fn handle_interrupt(&self) {
         // Currently we can only receive a tx interrupt, however we
         // need to check the interrupt cause nonetheless as this will
