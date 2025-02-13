@@ -311,7 +311,8 @@ impl Security {
         let asn_in_nonce = (scf & security_control::ASN_IN_NONCE) != 0;
 
         // Frame counter field
-        let frame_counter_present = (scf & security_control::FRAME_COUNTER_SUPPRESSION) != 0;
+        // if frame counter suppresion is enabled, the frame counter field will not be in the header
+        let frame_counter_present = (scf & security_control::FRAME_COUNTER_SUPPRESSION) == 0;
         let (off, frame_counter) = if frame_counter_present {
             let (off, frame_counter_be) = dec_try!(buf, off; decode_u32);
             (off, Some(u32::from_be(frame_counter_be)))
@@ -326,10 +327,10 @@ impl Security {
         stream_done!(
             off,
             Security {
-                level: level,
-                asn_in_nonce: asn_in_nonce,
-                frame_counter: frame_counter,
-                key_id: key_id,
+                level,
+                asn_in_nonce,
+                frame_counter,
+                key_id,
             }
         );
     }
@@ -350,17 +351,15 @@ mod ie_control {
     pub const TYPE: u16 = 0x8000;
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum HeaderIE<'a> {
-    Undissected { element_id: u8, content: &'a [u8] },
+    Undissected {
+        element_id: u8,
+        content: &'a [u8],
+    },
+    #[default]
     Termination1,
     Termination2,
-}
-
-impl Default for HeaderIE<'_> {
-    fn default() -> Self {
-        HeaderIE::Termination1
-    }
 }
 
 impl HeaderIE<'_> {
@@ -396,7 +395,7 @@ impl HeaderIE<'_> {
         stream_done!(off);
     }
 
-    pub fn decode<'b>(buf: &'b [u8]) -> SResult<HeaderIE<'b>> {
+    pub fn decode(buf: &[u8]) -> SResult<HeaderIE<'_>> {
         let (off, ie_ctl_be) = dec_try!(buf; decode_u16);
         let ie_ctl = u16::from_be(ie_ctl_be);
 
@@ -412,8 +411,8 @@ impl HeaderIE<'_> {
             0x7e => HeaderIE::Termination1,
             0x7f => HeaderIE::Termination2,
             element_id => HeaderIE::Undissected {
-                element_id: element_id,
-                content: content,
+                element_id,
+                content,
             },
         };
 
@@ -421,16 +420,14 @@ impl HeaderIE<'_> {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum PayloadIE<'a> {
-    Undissected { group_id: u8, content: &'a [u8] },
+    Undissected {
+        group_id: u8,
+        content: &'a [u8],
+    },
+    #[default]
     Termination,
-}
-
-impl Default for PayloadIE<'_> {
-    fn default() -> Self {
-        PayloadIE::Termination
-    }
 }
 
 impl PayloadIE<'_> {
@@ -462,7 +459,7 @@ impl PayloadIE<'_> {
         stream_done!(off);
     }
 
-    pub fn decode<'b>(buf: &'b [u8]) -> SResult<PayloadIE<'b>> {
+    pub fn decode(buf: &[u8]) -> SResult<PayloadIE<'_>> {
         let (off, ie_ctl_be) = dec_try!(buf; decode_u16);
         let ie_ctl = u16::from_be(ie_ctl_be);
 
@@ -477,10 +474,7 @@ impl PayloadIE<'_> {
 
         let ie = match element_id {
             0xf => PayloadIE::Termination,
-            group_id => PayloadIE::Undissected {
-                group_id: group_id,
-                content: content,
-            },
+            group_id => PayloadIE::Undissected { group_id, content },
         };
 
         stream_done!(off + content_len, ie);
@@ -773,20 +767,20 @@ impl Header<'_> {
             off,
             (
                 Header {
-                    frame_type: frame_type,
-                    frame_pending: frame_pending,
-                    ack_requested: ack_requested,
-                    version: version,
-                    seq: seq,
-                    dst_pan: dst_pan,
-                    dst_addr: dst_addr,
-                    src_pan: src_pan,
-                    src_addr: src_addr,
-                    security: security,
-                    header_ies: header_ies,
-                    header_ies_len: header_ies_len,
-                    payload_ies: payload_ies,
-                    payload_ies_len: payload_ies_len,
+                    frame_type,
+                    frame_pending,
+                    ack_requested,
+                    version,
+                    seq,
+                    dst_pan,
+                    dst_addr,
+                    src_pan,
+                    src_addr,
+                    security,
+                    header_ies,
+                    header_ies_len,
+                    payload_ies,
+                    payload_ies_len,
                 },
                 mac_payload_off
             )

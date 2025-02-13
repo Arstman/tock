@@ -14,68 +14,35 @@
 #  $ nix-shell
 #
 
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import <nixpkgs> {}, withUnfreePkgs ? false }:
 
 with builtins;
 let
   inherit (pkgs) stdenv lib;
 
-  pythonPackages = lib.fix' (self: with self; pkgs.python3Packages //
-  {
+  # Tockloader v1.12.0
+  tockloader = import (pkgs.fetchFromGitHub {
+    owner = "tock";
+    repo = "tockloader";
+    rev = "v1.12.0";
+    sha256 = "sha256-VgbAKDY/7ZVINDkqSHF7C0zRzVgtk8YG6O/ZmUpsh/g=";
+  }) { inherit pkgs withUnfreePkgs; };
 
-    tockloader = buildPythonPackage rec {
-      pname = "tockloader";
-      version = "1.9.0";
-      name = "${pname}-${version}";
+  rust_overlay = import "${pkgs.fetchFromGitHub {
+    owner = "nix-community";
+    repo = "fenix";
+    rev = "3743208cafd7bc3c150f0c77c25ef7430e9c0de2";
+    sha256 = "sha256-a5EMHpDAxLShxBKUdDVmqZMlfiuOtOUzet2xT/E/RiM=";
+  }}/overlay.nix";
 
-      propagatedBuildInputs = [
-        argcomplete
-        colorama
-        crcmod
-        pyserial
-        toml
-        tqdm
-        questionary
-      ];
-
-      src = fetchPypi {
-        inherit pname version;
-        sha256 = "sha256-7W55jugVtamFUL8N3dD1LFLJP2UDQb74V6o96rd/tEg=";
-      };
-    };
-  });
-
-  moz_overlay = import (builtins.fetchTarball https://github.com/mozilla/nixpkgs-mozilla/archive/master.tar.gz);
-  nixpkgs = import <nixpkgs> { overlays = [ moz_overlay ]; };
+  nixpkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
 
   # Get a custom cross-compile capable Rust install of a specific channel and
   # build. Tock expects a specific version of Rust with a selection of targets
   # and components to be present.
   rustBuild = (
-    nixpkgs.rustChannelOf (
-      let
-        # Read the ./rust-toolchain (and trim whitespace) so we can extrapolate
-        # the channel and date information. This makes it more convenient to
-        # update the Rust toolchain used.
-        rustToolchain = builtins.replaceStrings ["\n" "\r" " " "\t"] ["" "" "" ""] (
-          builtins.readFile ./rust-toolchain
-        );
-      in
-        {
-          channel = lib.head (lib.splitString "-" rustToolchain);
-          date = lib.concatStringsSep "-" (lib.tail (lib.splitString "-" rustToolchain));
-        }
-    )
-  ).rust.override {
-    targets = [
-      "thumbv7em-none-eabi" "thumbv7em-none-eabihf" "thumbv6m-none-eabi"
-      "riscv32imac-unknown-none-elf" "riscv32imc-unknown-none-elf" "riscv32i-unknown-none-elf"
-    ];
-    extensions = [
-      "rust-src" # required to compile the core library
-      "llvm-tools-preview" # currently required to support recently added flags
-    ];
-  };
+    nixpkgs.fenix.fromToolchainFile { file = ./rust-toolchain.toml; }
+  );
 
 in
   pkgs.mkShell {
@@ -84,17 +51,30 @@ in
     buildInputs = with pkgs; [
       # --- Toolchains ---
       rustBuild
+      openocd
 
       # --- Convenience and support packages ---
       python3Full
-      pythonPackages.tockloader
+      tockloader
 
       # Required for tools/print_tock_memory_usage.py
-      pythonPackages.cxxfilt
+      python3Packages.cxxfilt
 
 
       # --- CI support packages ---
       qemu
+
+      # --- Flashing tools ---
+      # If your board requires J-Link to flash and you are on NixOS,
+      # add these lines to your system wide configuration.
+
+      # Enable udev rules from segger-jlink package
+      # services.udev.packages = [
+      #     pkgs.segger-jlink
+      # ];
+
+      # Add "segger-jlink" to your system packages and accept the EULA:
+      # nixpkgs.config.segger-jlink.acceptLicense = true;
     ];
 
     LD_LIBRARY_PATH="${stdenv.cc.cc.lib}/lib64:$LD_LIBRARY_PATH";

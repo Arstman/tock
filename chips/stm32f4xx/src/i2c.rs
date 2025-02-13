@@ -12,7 +12,7 @@ use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeabl
 use kernel::utilities::registers::{register_bitfields, ReadWrite};
 use kernel::utilities::StaticRef;
 
-use crate::rcc;
+use crate::clocks::{phclk, Stm32f4Clocks};
 
 pub enum I2CSpeed {
     Speed100k,
@@ -210,12 +210,12 @@ enum I2CStatus {
 }
 
 impl<'a> I2C<'a> {
-    pub fn new(rcc: &'a rcc::Rcc) -> Self {
+    pub fn new(clocks: &'a dyn Stm32f4Clocks) -> Self {
         Self {
             registers: I2C1_BASE,
-            clock: I2CClock(rcc::PeripheralClock::new(
-                rcc::PeripheralClockType::APB1(rcc::PCLK1::I2C1),
-                rcc,
+            clock: I2CClock(phclk::PeripheralClock::new(
+                phclk::PeripheralClockType::APB1(phclk::PCLK1::I2C1),
+                clocks,
             )),
 
             master_client: OptionalCell::empty(),
@@ -290,7 +290,7 @@ impl<'a> I2C<'a> {
             // send the next byte
             if self.buffer.is_some() && self.tx_position.get() < self.tx_len.get() {
                 self.buffer.map(|buf| {
-                    let byte = buf[self.tx_position.get() as usize];
+                    let byte = buf[self.tx_position.get()];
                     self.registers.dr.write(DR::DR.val(byte as u32));
                     self.tx_position.set(self.tx_position.get() + 1);
                 });
@@ -302,7 +302,7 @@ impl<'a> I2C<'a> {
             let byte = self.registers.dr.read(DR::DR);
             if self.buffer.is_some() && self.rx_position.get() < self.rx_len.get() {
                 self.buffer.map(|buf| {
-                    buf[self.rx_position.get() as usize] = byte as u8;
+                    buf[self.rx_position.get()] = byte as u8;
                     self.rx_position.set(self.rx_position.get() + 1);
                 });
             }
@@ -472,7 +472,7 @@ impl<'a> i2c::I2CMaster<'a> for I2C<'a> {
     }
 }
 
-struct I2CClock<'a>(rcc::PeripheralClock<'a>);
+struct I2CClock<'a>(phclk::PeripheralClock<'a>);
 
 impl ClockInterface for I2CClock<'_> {
     fn is_enabled(&self) -> bool {

@@ -322,12 +322,12 @@ const BASE_ADDRESS: StaticRef<AdcRegisters> =
     unsafe { StaticRef::new(0x40038000 as *const AdcRegisters) };
 
 /// Functions for initializing the ADC.
-impl<'a> Adc<'a> {
+impl Adc<'_> {
     /// Create a new ADC driver.
     ///
     /// - `rx_dma_peripheral`: type used for DMA transactions
-    pub fn new(rx_dma_peripheral: dma::DMAPeripheral, pm: &'static pm::PowerManager) -> Adc {
-        Adc {
+    pub fn new(rx_dma_peripheral: dma::DMAPeripheral, pm: &'static pm::PowerManager) -> Self {
+        Self {
             // pointer to memory mapped I/O registers
             registers: BASE_ADDRESS,
 
@@ -345,7 +345,7 @@ impl<'a> Adc<'a> {
 
             // DMA status and stuff
             rx_dma: OptionalCell::empty(),
-            rx_dma_peripheral: rx_dma_peripheral,
+            rx_dma_peripheral,
             rx_length: Cell::new(0),
             next_dma_buffer: TakeCell::empty(),
             next_dma_length: Cell::new(0),
@@ -472,22 +472,21 @@ impl<'a> Adc<'a> {
             if frequency <= 113600 / 32 {
                 // RC oscillator
                 self.cpu_clock.set(false);
-                let max_freq: u32;
-                if frequency <= 32000 / 32 {
+                let max_freq: u32 = if frequency <= 32000 / 32 {
                     // frequency of the RC32K is 32KHz.
                     scif::generic_clock_enable(
                         scif::GenericClock::GCLK10,
                         scif::ClockSource::RC32K,
                     );
-                    max_freq = 32000 / 32;
+                    32000 / 32
                 } else {
                     // frequency of the RCSYS is 115KHz.
                     scif::generic_clock_enable(
                         scif::GenericClock::GCLK10,
                         scif::ClockSource::RCSYS,
                     );
-                    max_freq = 113600 / 32;
-                }
+                    113600 / 32
+                };
                 let divisor = (frequency + max_freq - 1) / frequency; // ceiling of division
                 let divisor_pow2 = math::closest_power_of_two(divisor);
                 let clock_divisor = cmp::min(math::log_base_two(divisor_pow2), 7);
@@ -505,12 +504,9 @@ impl<'a> Adc<'a> {
                 // and we solve for N
                 // becomes: N <= ceil(log_2(f(CLK_CPU)/1500000)) - 2
                 let cpu_frequency = self.pm.get_system_frequency();
-                let divisor = (cpu_frequency + (1500000 - 1)) / 1500000; // ceiling of division
+                let divisor = cpu_frequency.div_ceil(1500000);
                 let divisor_pow2 = math::closest_power_of_two(divisor);
-                let clock_divisor = cmp::min(
-                    math::log_base_two(divisor_pow2).checked_sub(2).unwrap_or(0),
-                    7,
-                );
+                let clock_divisor = cmp::min(math::log_base_two(divisor_pow2).saturating_sub(2), 7);
                 self.adc_clk_freq
                     .set(cpu_frequency / (1 << (clock_divisor + 2)));
                 cfg_val += Configuration::PRESCAL.val(clock_divisor);
@@ -620,8 +616,9 @@ impl<'a> hil::adc::Adc<'a> for Adc<'a> {
             self.timer_repeats.set(0);
             self.timer_counts.set(0);
 
-            let cfg = SequencerConfig::MUXNEG.val(0x7) + // ground pad
-                SequencerConfig::MUXPOS.val(channel.chan_num)
+            // MUXNEG.val(0x7) -> ground pad
+            let cfg = SequencerConfig::MUXNEG.val(0x7)
+                + SequencerConfig::MUXPOS.val(channel.chan_num)
                 + SequencerConfig::INTERNAL.val(0x2 | channel.internal)
                 + SequencerConfig::RES::Bits12
                 + SequencerConfig::TRGSEL::Software
@@ -670,8 +667,9 @@ impl<'a> hil::adc::Adc<'a> for Adc<'a> {
             self.continuous.set(true);
 
             // adc sequencer configuration
-            let mut cfg = SequencerConfig::MUXNEG.val(0x7) + // ground pad
-                SequencerConfig::MUXPOS.val(channel.chan_num)
+            // MUXNEG.val(0x7) -> ground pad
+            let mut cfg = SequencerConfig::MUXNEG.val(0x7)
+                + SequencerConfig::MUXPOS.val(channel.chan_num)
                 + SequencerConfig::INTERNAL.val(0x2 | channel.internal)
                 + SequencerConfig::RES::Bits12
                 + SequencerConfig::GCOMP::Disable
@@ -698,8 +696,7 @@ impl<'a> hil::adc::Adc<'a> for Adc<'a> {
                 // counter in addition and only actually perform a callback every N
                 // timer fires. This is important to enable low-jitter sampling in
                 // the 1-22 Hz range.
-                let timer_frequency;
-                if frequency < 23 {
+                let timer_frequency = if frequency < 23 {
                     // set a number of timer repeats before the callback is
                     // performed. 60 here is an arbitrary number which limits the
                     // actual itimer frequency to between 42 and 60 in the desired
@@ -708,13 +705,13 @@ impl<'a> hil::adc::Adc<'a> for Adc<'a> {
                     let counts = 60 / frequency;
                     self.timer_repeats.set(counts as u8);
                     self.timer_counts.set(0);
-                    timer_frequency = frequency * counts;
+                    frequency * counts
                 } else {
                     // we can sample at this frequency directly with the timer
                     self.timer_repeats.set(0);
                     self.timer_counts.set(0);
-                    timer_frequency = frequency;
-                }
+                    frequency
+                };
 
                 // set timer, limit to bounds
                 // f(timer) = f(adc) / (counter + 1)
@@ -864,8 +861,9 @@ impl<'a> hil::adc::AdcHighSpeed<'a> for Adc<'a> {
             self.next_dma_length.set(length2);
 
             // adc sequencer configuration
-            let mut cfg = SequencerConfig::MUXNEG.val(0x7) + // ground pad
-                SequencerConfig::MUXPOS.val(channel.chan_num)
+            // MUXNEG.val(0x7) -> ground pad
+            let mut cfg = SequencerConfig::MUXNEG.val(0x7)
+                + SequencerConfig::MUXPOS.val(channel.chan_num)
                 + SequencerConfig::INTERNAL.val(0x2 | channel.internal)
                 + SequencerConfig::RES::Bits12
                 + SequencerConfig::GCOMP::Disable
@@ -975,7 +973,7 @@ impl<'a> hil::adc::AdcHighSpeed<'a> for Adc<'a> {
 }
 
 /// Implements a client of a DMA.
-impl<'a> dma::DMAClient for Adc<'a> {
+impl dma::DMAClient for Adc<'_> {
     /// Handler for DMA transfer completion.
     ///
     /// - `pid`: the DMA peripheral that is complete

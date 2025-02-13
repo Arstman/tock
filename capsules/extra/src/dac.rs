@@ -7,7 +7,7 @@
 //! Usage
 //! -----
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let dac = static_init!(
@@ -29,7 +29,7 @@ pub struct Dac<'a> {
 
 impl<'a> Dac<'a> {
     pub fn new(dac: &'a dyn hil::dac::DacChannel) -> Dac<'a> {
-        Dac { dac: dac }
+        Dac { dac }
     }
 }
 
@@ -38,12 +38,12 @@ impl SyscallDriver for Dac<'_> {
     ///
     /// ### `command_num`
     ///
-    /// - `0`: Driver check.
+    /// - `0`: Driver existence check.
     /// - `1`: Initialize and enable the DAC.
     /// - `2`: Set the output to `data1`, a scaled output value.
     fn command(&self, command_num: usize, data: usize, _: usize, _: ProcessId) -> CommandReturn {
         match command_num {
-            0 /* check if present */ => CommandReturn::success(),
+            0 => CommandReturn::success(),
 
             // enable the dac. no-op as using the dac will enable it.
             1 => CommandReturn::success(),

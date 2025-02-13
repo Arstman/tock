@@ -23,7 +23,7 @@
 //! The `command` system call support one argument `cmd` which is used to specify the specific
 //! operation, currently the following cmd's are supported:
 //!
-//! * `0`: check whether the driver exist
+//! * `0`: driver existence check
 //! * `1`: read proximity
 //! * `2`: read proximity on interrupt
 //!
@@ -40,7 +40,7 @@
 //! You need a device that provides the `hil::sensors::ProximityDriver` trait.
 //! Here is an example of how to set up a proximity sensor with the apds9960 IC
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //!let grant_cap = create_capability!(capabilities::MemoryAllocationCapability);
@@ -71,17 +71,12 @@ pub struct App {
     upper_proximity: u8,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 pub enum ProximityCommand {
     ReadProximity = 1,
     ReadProximityOnInterrupt = 2,
+    #[default]
     NoCommand = 3,
-}
-
-impl Default for ProximityCommand {
-    fn default() -> Self {
-        ProximityCommand::NoCommand
-    }
 }
 
 #[derive(Default)]
@@ -102,7 +97,7 @@ impl<'a> ProximitySensor<'a> {
         grant: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
     ) -> ProximitySensor<'a> {
         ProximitySensor {
-            driver: driver,
+            driver,
             apps: grant,
             command_running: Cell::new(ProximityCommand::NoCommand),
         }
@@ -270,9 +265,7 @@ impl hil::sensors::ProximityClient for ProximitySensor<'_> {
                     if app.enqueued_command_type == ProximityCommand::ReadProximityOnInterrupt {
                         // Case: ReadProximityOnInterrupt
                         // Only callback to those apps which we expect would want to know about this threshold reading.
-                        if ((temp_val as u8) > app.upper_proximity)
-                            || ((temp_val as u8) < app.lower_proximity)
-                        {
+                        if (temp_val > app.upper_proximity) || (temp_val < app.lower_proximity) {
                             upcalls.schedule_upcall(0, (temp_val as usize, 0, 0)).ok();
                             app.subscribed = false; // dequeue
                         }
@@ -303,7 +296,7 @@ impl SyscallDriver for ProximitySensor<'_> {
         processid: ProcessId,
     ) -> CommandReturn {
         match command_num {
-            // check whether the driver exist!!
+            // Driver existence check
             0 => CommandReturn::success(),
 
             // Instantaneous proximity measurement

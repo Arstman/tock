@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
-//! This file contains the definition and implementation of a simple ICMPv6
-//! sending interface. The [ICMP6Sender](trait.ICMP6Sender.html) trait provides
-//! an interface for an upper layer to send an ICMPv6 packet, and the
-//! [ICMP6SendClient](trait.ICMP6SendClient.html) trait is implemented by the
-//! upper layer to allow them to receive the `send_done` callback once
-//! transmission has completed.
+//! Definition and implementation of a simple ICMPv6 sending
+//! interface.
 //!
-//! - Author: Conor McAvity <cmcavity@stanford.edu>
+//! The [ICMP6Sender](trait.ICMP6Sender.html) trait provides an
+//! interface for an upper layer to send an ICMPv6 packet, and the
+//! [ICMP6SendClient](trait.ICMP6SendClient.html) trait is implemented
+//! by the upper layer to allow them to receive the `send_done`
+//! callback once transmission has completed.
+// - Author: Conor McAvity <cmcavity@stanford.edu>
 
 use crate::net::icmpv6::ICMP6Header;
 use crate::net::ipv6::ip_utils::IPAddr;
@@ -18,7 +19,7 @@ use crate::net::ipv6::TransportHeader;
 use crate::net::network_capabilities::NetworkCapability;
 
 use kernel::utilities::cells::OptionalCell;
-use kernel::utilities::leasable_buffer::LeasableMutableBuffer;
+use kernel::utilities::leasable_buffer::SubSliceMut;
 use kernel::ErrorCode;
 
 /// A trait for a client of an `ICMP6Sender`.
@@ -70,7 +71,7 @@ pub struct ICMP6SendStruct<'a, T: IP6Sender<'a>> {
 impl<'a, T: IP6Sender<'a>> ICMP6SendStruct<'a, T> {
     pub fn new(ip_send_struct: &'a T) -> ICMP6SendStruct<'a, T> {
         ICMP6SendStruct {
-            ip_send_struct: ip_send_struct,
+            ip_send_struct,
             client: OptionalCell::empty(),
         }
     }
@@ -91,12 +92,8 @@ impl<'a, T: IP6Sender<'a>> ICMP6Sender<'a> for ICMP6SendStruct<'a, T> {
         let total_len = buf.len() + icmp_header.get_hdr_size();
         icmp_header.set_len(total_len as u16);
         let transport_header = TransportHeader::ICMP(icmp_header);
-        self.ip_send_struct.send_to(
-            dest,
-            transport_header,
-            &LeasableMutableBuffer::new(buf),
-            net_cap,
-        )
+        self.ip_send_struct
+            .send_to(dest, transport_header, &SubSliceMut::new(buf), net_cap)
     }
 }
 

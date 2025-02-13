@@ -347,13 +347,13 @@ impl<'a> RPPins<'a> {
                 let l_low_reg_no = pin * 4;
                 if (current_val & enabled_val & (1 << l_low_reg_no)) != 0 {
                     self.pins[pin + bank_no * 8].handle_interrupt();
-                } else if (current_val & enabled_val & (1 << l_low_reg_no + 1)) != 0 {
+                } else if (current_val & enabled_val & (1 << (l_low_reg_no + 1))) != 0 {
                     self.pins[pin + bank_no * 8].handle_interrupt();
-                } else if (current_val & enabled_val & (1 << l_low_reg_no + 2)) != 0 {
-                    self.gpio_registers.intr[bank_no].set(current_val & (1 << l_low_reg_no + 2));
+                } else if (current_val & enabled_val & (1 << (l_low_reg_no + 2))) != 0 {
+                    self.gpio_registers.intr[bank_no].set(current_val & (1 << (l_low_reg_no + 2)));
                     self.pins[pin + bank_no * 8].handle_interrupt();
-                } else if (current_val & enabled_val & (1 << l_low_reg_no + 3)) != 0 {
-                    self.gpio_registers.intr[bank_no].set(current_val & (1 << l_low_reg_no + 3));
+                } else if (current_val & enabled_val & (1 << (l_low_reg_no + 3))) != 0 {
+                    self.gpio_registers.intr[bank_no].set(current_val & (1 << (l_low_reg_no + 3)));
                     self.pins[pin + bank_no * 8].handle_interrupt();
                 }
             }
@@ -410,6 +410,10 @@ impl<'a> RPGpioPin<'a> {
         }
     }
 
+    pub(crate) fn pin(&self) -> usize {
+        self.pin
+    }
+
     fn get_mode(&self) -> hil::gpio::Configuration {
         //TODO - read alternate function
         let pad_output_disable = !self.gpio_pad_registers.gpio_pad[self.pin].is_set(GPIO_PAD::OD);
@@ -426,11 +430,7 @@ impl<'a> RPGpioPin<'a> {
     fn read_pin(&self) -> bool {
         //TODO - read alternate function
         let value = self.sio_registers.gpio_out.read(GPIO_OUT::OUT) & (1 << self.pin);
-        if value == 0 {
-            false
-        } else {
-            true
-        }
+        value != 0
     }
 
     pub fn set_function(&self, f: GpioFunction) {
@@ -500,17 +500,12 @@ impl<'a> hil::gpio::Interrupt<'a> for RPGpioPin<'a> {
         let interrupt_bank_no = self.pin / 8;
         let l_low_reg_no = (self.pin * 4) % 32;
         let current_val = self.gpio_registers.interrupt_proc[0].status[interrupt_bank_no].get();
-        if (current_val
+        (current_val
             & (1 << l_low_reg_no)
-            & (1 << l_low_reg_no + 1)
-            & (1 << l_low_reg_no + 2)
-            & (1 << l_low_reg_no + 3))
-            == 0
-        {
-            false
-        } else {
-            true
-        }
+            & (1 << (l_low_reg_no + 1))
+            & (1 << (l_low_reg_no + 2))
+            & (1 << (l_low_reg_no + 3)))
+            != 0
     }
 
     fn enable_interrupts(&self, mode: hil::gpio::InterruptEdge) {
@@ -653,11 +648,7 @@ impl hil::gpio::Output for RPGpioPin<'_> {
 impl hil::gpio::Input for RPGpioPin<'_> {
     fn read(&self) -> bool {
         let value = self.sio_registers.gpio_in.read(GPIO_IN::IN) & (1 << self.pin);
-        if value == 0 {
-            false
-        } else {
-            true
-        }
+        value != 0
     }
 }
 

@@ -30,7 +30,7 @@
 //!
 //! Here is a sample usage of this capsule in a board's main.rs file:
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let buffer = static_init!([u8; capsules::ltc294x::BUF_LEN], [0; capsules::ltc294x::BUF_LEN]);
@@ -155,8 +155,8 @@ impl<'a, I: i2c::I2CDevice> LTC294X<'a, I> {
         buffer: &'static mut [u8],
     ) -> LTC294X<'a, I> {
         LTC294X {
-            i2c: i2c,
-            interrupt_pin: interrupt_pin,
+            i2c,
+            interrupt_pin,
             model: Cell::new(ChipModel::LTC2941),
             state: Cell::new(State::Idle),
             buffer: TakeCell::new(buffer),
@@ -423,22 +423,38 @@ impl<I: i2c::I2CDevice> gpio::Client for LTC294X<'_, I> {
     }
 }
 
+/// IDs for subscribed upcalls.
+mod upcall {
+    /// The callback that that is triggered when events finish and when readings
+    /// are ready. The first argument represents which callback was triggered.
+    ///
+    /// - `0`: Interrupt occurred from the LTC294X.
+    /// - `1`: Got the status.
+    /// - `2`: Read the charge used.
+    /// - `3`: `done()` was called.
+    /// - `4`: Read the voltage.
+    /// - `5`: Read the current.
+    pub const EVENT_FINISHED: usize = 0;
+    /// Number of upcalls.
+    pub const COUNT: u8 = 1;
+}
+
 /// Default implementation of the LTC2941 driver that provides a Driver
 /// interface for providing access to applications.
 pub struct LTC294XDriver<'a, I: i2c::I2CDevice> {
     ltc294x: &'a LTC294X<'a, I>,
-    grants: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
+    grants: Grant<App, UpcallCount<{ upcall::COUNT }>, AllowRoCount<0>, AllowRwCount<0>>,
     owning_process: OptionalCell<ProcessId>,
 }
 
 impl<'a, I: i2c::I2CDevice> LTC294XDriver<'a, I> {
     pub fn new(
         ltc: &'a LTC294X<'a, I>,
-        grants: Grant<App, UpcallCount<1>, AllowRoCount<0>, AllowRwCount<0>>,
+        grants: Grant<App, UpcallCount<{ upcall::COUNT }>, AllowRoCount<0>, AllowRwCount<0>>,
     ) -> LTC294XDriver<'a, I> {
         LTC294XDriver {
             ltc294x: ltc,
-            grants: grants,
+            grants,
             owning_process: OptionalCell::empty(),
         }
     }
@@ -447,8 +463,10 @@ impl<'a, I: i2c::I2CDevice> LTC294XDriver<'a, I> {
 impl<I: i2c::I2CDevice> LTC294XClient for LTC294XDriver<'_, I> {
     fn interrupt(&self) {
         self.owning_process.map(|pid| {
-            let _res = self.grants.enter(*pid, |_app, upcalls| {
-                upcalls.schedule_upcall(0, (0, 0, 0)).ok();
+            let _res = self.grants.enter(pid, |_app, upcalls| {
+                upcalls
+                    .schedule_upcall(upcall::EVENT_FINISHED, (0, 0, 0))
+                    .ok();
             });
         });
     }
@@ -467,9 +485,12 @@ impl<I: i2c::I2CDevice> LTC294XClient for LTC294XDriver<'_, I> {
             | ((charge_alert_high as usize) << 3)
             | ((accumulated_charge_overflow as usize) << 4);
         self.owning_process.map(|pid| {
-            let _res = self.grants.enter(*pid, |_app, upcalls| {
+            let _res = self.grants.enter(pid, |_app, upcalls| {
                 upcalls
-                    .schedule_upcall(0, (1, ret, self.ltc294x.model.get() as usize))
+                    .schedule_upcall(
+                        upcall::EVENT_FINISHED,
+                        (1, ret, self.ltc294x.model.get() as usize),
+                    )
                     .ok();
             });
         });
@@ -477,57 +498,51 @@ impl<I: i2c::I2CDevice> LTC294XClient for LTC294XDriver<'_, I> {
 
     fn charge(&self, charge: u16) {
         self.owning_process.map(|pid| {
-            let _res = self.grants.enter(*pid, |_app, upcalls| {
-                upcalls.schedule_upcall(0, (2, charge as usize, 0)).ok();
+            let _res = self.grants.enter(pid, |_app, upcalls| {
+                upcalls
+                    .schedule_upcall(upcall::EVENT_FINISHED, (2, charge as usize, 0))
+                    .ok();
             });
         });
     }
 
     fn done(&self) {
         self.owning_process.map(|pid| {
-            let _res = self.grants.enter(*pid, |_app, upcalls| {
-                upcalls.schedule_upcall(0, (3, 0, 0)).ok();
+            let _res = self.grants.enter(pid, |_app, upcalls| {
+                upcalls
+                    .schedule_upcall(upcall::EVENT_FINISHED, (3, 0, 0))
+                    .ok();
             });
         });
     }
 
     fn voltage(&self, voltage: u16) {
         self.owning_process.map(|pid| {
-            let _res = self.grants.enter(*pid, |_app, upcalls| {
-                upcalls.schedule_upcall(0, (4, voltage as usize, 0)).ok();
+            let _res = self.grants.enter(pid, |_app, upcalls| {
+                upcalls
+                    .schedule_upcall(upcall::EVENT_FINISHED, (4, voltage as usize, 0))
+                    .ok();
             });
         });
     }
 
     fn current(&self, current: u16) {
         self.owning_process.map(|pid| {
-            let _res = self.grants.enter(*pid, |_app, upcalls| {
-                upcalls.schedule_upcall(0, (5, current as usize, 0)).ok();
+            let _res = self.grants.enter(pid, |_app, upcalls| {
+                upcalls
+                    .schedule_upcall(upcall::EVENT_FINISHED, (5, current as usize, 0))
+                    .ok();
             });
         });
     }
 }
 
 impl<I: i2c::I2CDevice> SyscallDriver for LTC294XDriver<'_, I> {
-    // Setup callbacks.
-    //
-    // ### `subscribe_num`
-    //
-    // - `0`: Set the callback that that is triggered when events finish and
-    //   when readings are ready. The first argument represents which callback
-    //   was triggered.
-    //   - `0`: Interrupt occurred from the LTC294X.
-    //   - `1`: Got the status.
-    //   - `2`: Read the charge used.
-    //   - `3`: `done()` was called.
-    //   - `4`: Read the voltage.
-    //   - `5`: Read the current.
-
     /// Request operations for the LTC294X chip.
     ///
     /// ### `command_num`
     ///
-    /// - `0`: Driver check.
+    /// - `0`: Driver existence check.
     /// - `1`: Get status of the chip.
     /// - `2`: Configure settings of the chip.
     /// - `3`: Reset accumulated charge measurement to zero.
@@ -555,7 +570,7 @@ impl<I: i2c::I2CDevice> SyscallDriver for LTC294XDriver<'_, I> {
 
         let match_or_empty_or_nonexistant = self.owning_process.map_or(true, |current_process| {
             self.grants
-                .enter(*current_process, |_, _| current_process == &process_id)
+                .enter(current_process, |_, _| current_process == process_id)
                 .unwrap_or(true)
         });
         if match_or_empty_or_nonexistant {

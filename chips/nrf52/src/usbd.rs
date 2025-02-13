@@ -5,7 +5,7 @@
 //! Universal Serial Bus Device with EasyDMA (USBD)
 
 use core::cell::Cell;
-use cortexm4::support::atomic;
+use cortexm4f::support::atomic;
 use kernel::hil;
 use kernel::hil::usb::TransferType;
 use kernel::utilities::cells::{OptionalCell, VolatileCell};
@@ -326,7 +326,7 @@ mod detail {
 
     impl<'a> EndpointRegisters<'a> {
         pub fn set_buffer(&self, slice: &'a [VolatileCell<u8>]) {
-            self.ptr.set(slice.as_ptr() as *const u8);
+            self.ptr.set(slice.as_ptr().cast::<u8>());
             self.maxcnt.write(Count::MAXCNT.val(slice.len() as u32));
         }
     }
@@ -1335,7 +1335,7 @@ impl<'a> Usbd<'a> {
         // ms), but then the EPDATA event on the very first IN transfer
         // immediately after the `client.bus_reset()` call below never occurs.
         for _ in 0..800000 {
-            cortexm4::support::nop();
+            cortexm4f::support::nop();
         }
 
         // TODO: reset controller stack
@@ -1923,7 +1923,7 @@ impl<'a> Usbd<'a> {
     }
 }
 
-impl<'a> power::PowerClient for Usbd<'a> {
+impl power::PowerClient for Usbd<'_> {
     fn handle_power_event(&self, event: power::PowerEvent) {
         match event {
             power::PowerEvent::UsbPluggedIn => self.enable(),

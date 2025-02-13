@@ -2,22 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
-//! This file contains the definition and implementation for a virtualized UDP
-//! sending interface. The [UDPSender](trait.UDPSender.html) trait provides
+//! Definition and implementation for a virtualized UDP sending
+//! interface.
+//!
+//! The [UDPSender](trait.UDPSender.html) trait provides
 //! an interface for kernel capsules to send a UDP packet, and the
 //! [UDPSendClient](trait.UDPSendClient.html) trait is implemented by
 //! upper layer clients to allow them to receive `send_done` callbacks once
 //! transmission has completed.
-//! In order to virtualize between both apps and kernel capsules, this file
-//! uses a MuxUdpSender which treats the userspace UDP driver as a kernel capsule
-//! with a special capability that allows it to bind to arbitrary ports. Therefore
-//! the correctness of port binding / packet transmission/delivery is also dependent
-//! on the port binding logic in the driver being correct.
-//! The MuxUdpSender acts as a FIFO queue for transmitted packets, with each capsule being allowed
-//! a single outstanding / unsent packet at a time.
-//! Because the userspace driver is viewed by the MuxUdpSender as being a single capsule,
-//! the userspace driver must queue app packets on its own, as it can only pass a single
-//! packet to the MuxUdpSender queue at a time.
+//!
+//! In order to virtualize between both apps and kernel capsules, this
+//! file uses a MuxUdpSender which treats the userspace UDP driver as
+//! a kernel capsule with a special capability that allows it to bind
+//! to arbitrary ports. Therefore the correctness of port binding /
+//! packet transmission/delivery is also dependent on the port binding
+//! logic in the driver being correct.
+//!
+//! The MuxUdpSender acts as a FIFO queue for transmitted packets,
+//! with each capsule being allowed a single outstanding / unsent
+//! packet at a time.
+//!
+//! Because the userspace driver is viewed by the MuxUdpSender as
+//! being a single capsule, the userspace driver must queue app
+//! packets on its own, as it can only pass a single packet to the
+//! MuxUdpSender queue at a time.
 
 use crate::net::ipv6::ip_utils::IPAddr;
 use crate::net::ipv6::ipv6_send::{IP6SendClient, IP6Sender};
@@ -32,7 +40,7 @@ use kernel::capabilities::UdpDriverCapability;
 use kernel::collections::list::{List, ListLink, ListNode};
 use kernel::debug;
 use kernel::utilities::cells::{MapCell, OptionalCell};
-use kernel::utilities::leasable_buffer::LeasableMutableBuffer;
+use kernel::utilities::leasable_buffer::SubSliceMut;
 use kernel::ErrorCode;
 
 pub struct MuxUdpSender<'a, T: IP6Sender<'a>> {
@@ -153,14 +161,16 @@ impl<'a, T: IP6Sender<'a>> IP6SendClient for MuxUdpSender<'a, T> {
 /// has completed sending the requested packet. Note that the
 /// `UDPSender::set_client` method must be called to set the client.
 pub trait UDPSendClient {
-    fn send_done(&self, result: Result<(), ErrorCode>, dgram: LeasableMutableBuffer<'static, u8>);
+    fn send_done(&self, result: Result<(), ErrorCode>, dgram: SubSliceMut<'static, u8>);
 }
 
-/// This trait represents the bulk of the UDP functionality. The two
-/// variants of sending a packet (either via the `send_to` or `send` methods)
-/// represent whether the caller wants to construct a custom `UDPHeader` or
-/// not. Calling `send_to` tells the UDP layer to construct a default
-/// `UDPHeader` and forward the payload to the respective destination and port.
+/// This trait represents the bulk of the UDP functionality.
+///
+/// The two variants of sending a packet (either via the `send_to` or
+/// `send` methods) represent whether the caller wants to construct a
+/// custom `UDPHeader` or not. Calling `send_to` tells the UDP layer
+/// to construct a default `UDPHeader` and forward the payload to the
+/// respective destination and port.
 pub trait UDPSender<'a> {
     /// This function sets the client for the `UDPSender` instance
     ///
@@ -187,9 +197,9 @@ pub trait UDPSender<'a> {
         dest: IPAddr,
         dst_port: u16,
         //src_port: u16,
-        buf: LeasableMutableBuffer<'static, u8>,
+        buf: SubSliceMut<'static, u8>,
         net_cap: &'static NetworkCapability,
-    ) -> Result<(), LeasableMutableBuffer<'static, u8>>;
+    ) -> Result<(), SubSliceMut<'static, u8>>;
 
     /// This function is identical to `send_to()` except that it takes in
     /// an explicit src_port instead of a binding. This allows it to be used
@@ -209,10 +219,10 @@ pub trait UDPSender<'a> {
         dest: IPAddr,
         dst_port: u16,
         src_port: u16,
-        buf: LeasableMutableBuffer<'static, u8>,
+        buf: SubSliceMut<'static, u8>,
         driver_send_cap: &dyn UdpDriverCapability,
         net_cap: &'static NetworkCapability,
-    ) -> Result<(), LeasableMutableBuffer<'static, u8>>;
+    ) -> Result<(), SubSliceMut<'static, u8>>;
 
     /// This function constructs an IP packet from the completed `UDPHeader`
     /// and buffer, and sends it to the provided IP address
@@ -229,9 +239,9 @@ pub trait UDPSender<'a> {
         &'a self,
         dest: IPAddr,
         udp_header: UDPHeader,
-        buf: LeasableMutableBuffer<'static, u8>,
+        buf: SubSliceMut<'static, u8>,
         net_cap: &'static NetworkCapability,
-    ) -> Result<(), LeasableMutableBuffer<'static, u8>>;
+    ) -> Result<(), SubSliceMut<'static, u8>>;
 
     fn get_binding(&self) -> Option<UdpPortBindingTx>;
 
@@ -247,7 +257,7 @@ pub struct UDPSendStruct<'a, T: IP6Sender<'a>> {
     udp_mux_sender: &'a MuxUdpSender<'a, T>,
     client: OptionalCell<&'a dyn UDPSendClient>,
     next: ListLink<'a, UDPSendStruct<'a, T>>,
-    tx_buffer: MapCell<LeasableMutableBuffer<'static, u8>>,
+    tx_buffer: MapCell<SubSliceMut<'static, u8>>,
     next_dest: Cell<IPAddr>,
     next_th: OptionalCell<TransportHeader>,
     binding: MapCell<UdpPortBindingTx>,
@@ -272,9 +282,9 @@ impl<'a, T: IP6Sender<'a>> UDPSender<'a> for UDPSendStruct<'a, T> {
         &'a self,
         dest: IPAddr,
         dst_port: u16,
-        buf: LeasableMutableBuffer<'static, u8>,
+        buf: SubSliceMut<'static, u8>,
         net_cap: &'static NetworkCapability,
-    ) -> Result<(), LeasableMutableBuffer<'static, u8>> {
+    ) -> Result<(), SubSliceMut<'static, u8>> {
         let mut udp_header = UDPHeader::new();
         udp_header.set_dst_port(dst_port);
         match self.binding.take() {
@@ -303,10 +313,10 @@ impl<'a, T: IP6Sender<'a>> UDPSender<'a> for UDPSendStruct<'a, T> {
         dest: IPAddr,
         dst_port: u16,
         src_port: u16,
-        buf: LeasableMutableBuffer<'static, u8>,
+        buf: SubSliceMut<'static, u8>,
         _driver_send_cap: &dyn UdpDriverCapability,
         net_cap: &'static NetworkCapability,
-    ) -> Result<(), LeasableMutableBuffer<'static, u8>> {
+    ) -> Result<(), SubSliceMut<'static, u8>> {
         let mut udp_header = UDPHeader::new();
         udp_header.set_dst_port(dst_port);
         udp_header.set_src_port(src_port);
@@ -317,9 +327,9 @@ impl<'a, T: IP6Sender<'a>> UDPSender<'a> for UDPSendStruct<'a, T> {
         &'a self,
         dest: IPAddr,
         mut udp_header: UDPHeader,
-        buf: LeasableMutableBuffer<'static, u8>,
+        buf: SubSliceMut<'static, u8>,
         net_cap: &'static NetworkCapability,
-    ) -> Result<(), LeasableMutableBuffer<'static, u8>> {
+    ) -> Result<(), SubSliceMut<'static, u8>> {
         udp_header.set_len((buf.len() + udp_header.get_hdr_size()) as u16);
         let transport_header = TransportHeader::UDP(udp_header);
         self.tx_buffer.replace(buf);
@@ -327,7 +337,7 @@ impl<'a, T: IP6Sender<'a>> UDPSender<'a> for UDPSendStruct<'a, T> {
         self.next_th.replace(transport_header); // th = transport header
         match self
             .udp_mux_sender
-            .send_to(dest, transport_header, &self, net_cap)
+            .send_to(dest, transport_header, self, net_cap)
         {
             Ok(()) => Ok(()),
             _ => Err(self.tx_buffer.take().unwrap()),
@@ -353,14 +363,14 @@ impl<'a, T: IP6Sender<'a>> UDPSendStruct<'a, T> {
         udp_vis: &'static UdpVisibilityCapability,
     ) -> UDPSendStruct<'a, T> {
         UDPSendStruct {
-            udp_mux_sender: udp_mux_sender,
+            udp_mux_sender,
             client: OptionalCell::empty(),
             next: ListLink::empty(),
             tx_buffer: MapCell::empty(),
             next_dest: Cell::new(IPAddr::new()),
             next_th: OptionalCell::empty(),
             binding: MapCell::empty(),
-            udp_vis: udp_vis,
+            udp_vis,
             net_cap: OptionalCell::empty(),
         }
     }

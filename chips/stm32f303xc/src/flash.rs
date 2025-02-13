@@ -234,13 +234,11 @@ const KEY2: u32 = 0xCDEF89AB;
 ///
 /// let pagebuffer = unsafe { static_init!(StmF303Page, StmF303Page::default()) };
 /// ```
-pub struct StmF303Page(pub [u8; PAGE_SIZE as usize]);
+pub struct StmF303Page(pub [u8; PAGE_SIZE]);
 
 impl Default for StmF303Page {
     fn default() -> Self {
-        Self {
-            0: [0; PAGE_SIZE as usize],
-        }
+        Self([0; PAGE_SIZE])
     }
 }
 
@@ -352,7 +350,7 @@ impl Flash {
 
                         self.client.map(|client| {
                             self.buffer.take().map(|buffer| {
-                                client.write_complete(buffer, hil::flash::Error::CommandComplete);
+                                client.write_complete(buffer, Ok(()));
                             });
                         });
                     } else {
@@ -370,7 +368,7 @@ impl Flash {
 
                     self.state.set(FlashState::Ready);
                     self.client.map(|client| {
-                        client.erase_complete(hil::flash::Error::CommandComplete);
+                        client.erase_complete(Ok(()));
                     });
                 }
                 FlashState::WriteOption => {
@@ -379,7 +377,7 @@ impl Flash {
 
                     self.client.map(|client| {
                         self.buffer.take().map(|buffer| {
-                            client.write_complete(buffer, hil::flash::Error::CommandComplete);
+                            client.write_complete(buffer, Ok(()));
                         });
                     });
                 }
@@ -388,7 +386,7 @@ impl Flash {
                     self.state.set(FlashState::Ready);
 
                     self.client.map(|client| {
-                        client.erase_complete(hil::flash::Error::CommandComplete);
+                        client.erase_complete(Ok(()));
                     });
                 }
                 _ => {}
@@ -399,7 +397,7 @@ impl Flash {
             self.state.set(FlashState::Ready);
             self.client.map(|client| {
                 self.buffer.take().map(|buffer| {
-                    client.read_complete(buffer, hil::flash::Error::CommandComplete);
+                    client.read_complete(buffer, Ok(()));
                 });
             });
         }
@@ -413,13 +411,13 @@ impl Flash {
                     self.registers.cr.modify(Control::PG::CLEAR);
                     self.client.map(|client| {
                         self.buffer.take().map(|buffer| {
-                            client.write_complete(buffer, hil::flash::Error::FlashError);
+                            client.write_complete(buffer, Err(hil::flash::Error::FlashError));
                         });
                     });
                 }
                 FlashState::Erase => {
                     self.client.map(|client| {
-                        client.erase_complete(hil::flash::Error::FlashError);
+                        client.erase_complete(Err(hil::flash::Error::FlashError));
                     });
                 }
                 _ => {}
@@ -437,7 +435,7 @@ impl Flash {
                     self.registers.cr.modify(Control::PG::CLEAR);
                     self.client.map(|client| {
                         self.buffer.take().map(|buffer| {
-                            client.write_complete(buffer, hil::flash::Error::FlashError);
+                            client.write_complete(buffer, Err(hil::flash::Error::FlashError));
                         });
                     });
                 }
@@ -445,13 +443,13 @@ impl Flash {
                     self.registers.cr.modify(Control::OPTPG::CLEAR);
                     self.client.map(|client| {
                         self.buffer.take().map(|buffer| {
-                            client.write_complete(buffer, hil::flash::Error::FlashError);
+                            client.write_complete(buffer, Err(hil::flash::Error::FlashError));
                         });
                     });
                 }
                 FlashState::Erase => {
                     self.client.map(|client| {
-                        client.erase_complete(hil::flash::Error::FlashError);
+                        client.erase_complete(Err(hil::flash::Error::FlashError));
                     });
                 }
                 _ => {}

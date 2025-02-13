@@ -11,7 +11,7 @@
 //! client of the hardware implementation. For example, using the SAM4L's `CrcU`
 //! driver:
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! let crc_buffer = static_init!([u8; 64], [0; 64]);
@@ -87,7 +87,7 @@ use kernel::processbuffer::{ReadableProcessBuffer, ReadableProcessSlice};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::NumericCellExt;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::utilities::leasable_buffer::LeasableMutableBuffer;
+use kernel::utilities::leasable_buffer::SubSliceMut;
 use kernel::{ErrorCode, ProcessId};
 
 /// Syscall driver number.
@@ -131,7 +131,7 @@ impl<'a, C: Crc<'a>> CrcDriver<'a, C> {
     ///
     /// ## Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// capsules::crc::Crc::new(&sam4l::crccu::CrcCU, board_kernel.create_grant(&grant_cap));
     /// ```
     ///
@@ -156,7 +156,7 @@ impl<'a, C: Crc<'a>> CrcDriver<'a, C> {
                 kbuffer[i] = data[i].get();
             }
             if copy_len > 0 {
-                let mut leasable = LeasableMutableBuffer::new(kbuffer);
+                let mut leasable = SubSliceMut::new(kbuffer);
                 leasable.slice(0..copy_len);
                 let res = self.crc.input(leasable);
                 match res {
@@ -366,7 +366,7 @@ impl<'a, C: Crc<'a>> SyscallDriver for CrcDriver<'a, C> {
                         if self.current_process.is_none() {
                             self.next_request().map_or_else(
                                 |e| CommandReturn::failure(ErrorCode::into(e)),
-                                |_| CommandReturn::success(),
+                                |()| CommandReturn::success(),
                             )
                         } else {
                             // Another request is ongoing. We've enqueued this one,
@@ -387,17 +387,13 @@ impl<'a, C: Crc<'a>> SyscallDriver for CrcDriver<'a, C> {
 }
 
 impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
-    fn input_done(
-        &self,
-        result: Result<(), ErrorCode>,
-        buffer: LeasableMutableBuffer<'static, u8>,
-    ) {
+    fn input_done(&self, result: Result<(), ErrorCode>, buffer: SubSliceMut<'static, u8>) {
         // A call to `input` has finished. This can mean that either
         // we have processed the entire buffer passed in, or it was
         // truncated by the CRC unit as it was too large. In the first
         // case, we can see whether there is more outstanding data
         // from the app, whereas in the latter we need to advance the
-        // LeasableMutableBuffer window and pass it in again.
+        // SubSliceMut window and pass it in again.
         let mut computing = false;
         // There are three outcomes to this match:
         //   - crc_buffer is not put back: input is ongoing
@@ -410,7 +406,7 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                     // Put the kernel buffer back
                     self.crc_buffer.replace(buffer.take());
                     self.current_process.map(|pid| {
-                        let _res = self.grant.enter(*pid, |grant, kernel_data| {
+                        let _res = self.grant.enter(pid, |grant, kernel_data| {
                             // This shouldn't happen unless there's a way to clear out a request
                             // through a system call: regardless, the request is gone, so cancel
                             // the CRC.
@@ -505,7 +501,7 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                         Err((e, returned_buffer)) => {
                             self.crc_buffer.replace(returned_buffer.take());
                             self.current_process.map(|pid| {
-                                let _res = self.grant.enter(*pid, |grant, kernel_data| {
+                                let _res = self.grant.enter(pid, |grant, kernel_data| {
                                     grant.request = None;
                                     kernel_data
                                         .schedule_upcall(
@@ -523,7 +519,7 @@ impl<'a, C: Crc<'a>> Client for CrcDriver<'a, C> {
                 // The callback returned an error, pass it back to userspace
                 self.crc_buffer.replace(buffer.take());
                 self.current_process.map(|pid| {
-                    let _res = self.grant.enter(*pid, |grant, kernel_data| {
+                    let _res = self.grant.enter(pid, |grant, kernel_data| {
                         grant.request = None;
                         kernel_data
                             .schedule_upcall(0, (kernel::errorcode::into_statuscode(Err(e)), 0, 0))

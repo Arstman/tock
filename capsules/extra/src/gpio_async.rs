@@ -11,7 +11,7 @@
 //! Usage
 //! -----
 //!
-//! ```rust
+//! ```rust,ignore
 //! # use kernel::static_init;
 //!
 //! // Generate a list of ports to group into one userspace driver.
@@ -76,7 +76,7 @@ impl<'a, Port: hil::gpio_async::Port> GPIOAsync<'a, Port> {
     }
 
     fn configure_input_pin(&self, port: usize, pin: usize, config: usize) -> Result<(), ErrorCode> {
-        let ports = self.ports.as_ref();
+        let ports = self.ports;
         let mode = match config {
             0 => hil::gpio::FloatingState::PullNone,
             1 => hil::gpio::FloatingState::PullUp,
@@ -87,7 +87,7 @@ impl<'a, Port: hil::gpio_async::Port> GPIOAsync<'a, Port> {
     }
 
     fn configure_interrupt(&self, port: usize, pin: usize, config: usize) -> Result<(), ErrorCode> {
-        let ports = self.ports.as_ref();
+        let ports = self.ports;
         let mode = match config {
             0 => hil::gpio::InterruptEdge::EitherEdge,
             1 => hil::gpio::InterruptEdge::RisingEdge,
@@ -109,7 +109,7 @@ impl<Port: hil::gpio_async::Port> hil::gpio_async::Client for GPIOAsync<'_, Port
     fn done(&self, value: usize) {
         // alert currently configuring app
         self.configuring_process.map(|pid| {
-            let _ = self.grants.enter(*pid, |_app, upcalls| {
+            let _ = self.grants.enter(pid, |_app, upcalls| {
                 upcalls.schedule_upcall(0, (0, value, 0)).ok();
             });
         });
@@ -143,7 +143,7 @@ impl<Port: hil::gpio_async::Port> SyscallDriver for GPIOAsync<'_, Port> {
     ///
     /// ### `command_num`
     ///
-    /// - `0`: Driver check and get number of GPIO ports supported.
+    /// - `0`: Driver existence check.
     /// - `1`: Set a pin as an output.
     /// - `2`: Set a pin high by setting it to 1.
     /// - `3`: Clear a pin by setting it to 0.
@@ -158,6 +158,7 @@ impl<Port: hil::gpio_async::Port> SyscallDriver for GPIOAsync<'_, Port> {
     ///   interrupt, and 2 for a falling edge interrupt.
     /// - `8`: Disable an interrupt on a pin.
     /// - `9`: Disable a GPIO pin.
+    /// - `10`: Get number of GPIO ports supported.
     fn command(
         &self,
         command_number: usize,
@@ -167,11 +168,16 @@ impl<Port: hil::gpio_async::Port> SyscallDriver for GPIOAsync<'_, Port> {
     ) -> CommandReturn {
         let port = data & 0xFFFF;
         let other = (data >> 16) & 0xFFFF;
-        let ports = self.ports.as_ref();
+        let ports = self.ports;
 
-        // Special case command 0; everything else results in a process-owned,
-        // split-phase call.
+        // Driver existence check.
         if command_number == 0 {
+            CommandReturn::success();
+        }
+
+        // Special case command 10; everything else results in a process-owned,
+        // split-phase call.
+        if command_number == 10 {
             // How many ports
             return CommandReturn::success_u32(ports.len() as u32);
         }

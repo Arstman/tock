@@ -6,9 +6,6 @@
 
 BUILD_DIR="verilator_build/"
 
-# Preemptively cleanup layout (incase this was a test) so that following apps (non-tests) load the correct layout.
-rm $TOCK_ROOT_DIRECTORY/target/$TARGET/release/deps/layout.ld
-
 if [[ "${VERILATOR}" == "yes" ]]; then
 		if [ -d "$BUILD_DIR" ]; then
 			# Cleanup before we build again
@@ -33,7 +30,7 @@ if [[ "${VERILATOR}" == "yes" ]]; then
 		-binary -range-pad 8 --output "$BUILD_DIR"/binary.64.vmem --vmem 64
 	${OPENTITAN_TREE}/bazel-bin/hw/build.verilator_real/sim-verilator/Vchip_sim_tb \
 		--meminit=rom,${OPENTITAN_TREE}/bazel-out/k8-fastbuild-ST-2cc462681f62/bin/sw/device/lib/testing/test_rom/test_rom_sim_verilator.39.scr.vmem \
-		--meminit=flash,./"$BUILD_DIR"/binary.64.vmem \
+		--meminit=flash0,./"$BUILD_DIR"/binary.64.vmem \
 		--meminit=otp,${OPENTITAN_TREE}/bazel-out/k8-fastbuild/bin/hw/ip/otp_ctrl/data/img_rma.24.vmem
 elif [[ "${OPENTITAN_TREE}" != "" ]]; then
 	${OBJCOPY} --update-section .apps=${APP} ${1} bundle.elf
